@@ -1,4 +1,21 @@
-- name: Bach Installer
+name: Build with Bach
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with Bach
+        uses: usebach/bach@v0.2.1
+        with:
+          config: bach.toml- name: Bach Installer
   # You may pin to the exact commit or the version.
   # uses: usebach/bach@d034dea9a3fd49d715685e251427b6fc0001d2cc
   uses: usebach/bach@v0.2.1
