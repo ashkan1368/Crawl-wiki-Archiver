@@ -1,0 +1,6 @@
+{
+  "name": "WikIran Archive",
+  "description": "Bilingual (Persian/English) local research archive and desktop application for organizing publicly published articles and publication catalogues from WikIran.org with SQLite FTS5 full-text search, Excel/CSV/JSON exports, and automated backups.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
