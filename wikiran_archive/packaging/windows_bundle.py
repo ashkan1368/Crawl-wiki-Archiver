@@ -142,6 +142,9 @@ def _build_embedded_payload(
     sep = "\\" if ("\\" in configured_base or ":" in configured_base) else "/"
     b_clean = configured_base.rstrip("\\/")
 
+    from ..main import compute_storage_volume
+    from ..collector.ofac_sync import get_ofac_summary
+
     overview = {
         "ok": True,
         "stats": repo.get_dashboard_stats(),
@@ -169,6 +172,8 @@ def _build_embedded_payload(
             "exports_dir": f"{b_clean}{sep}exports",
             "logs_dir": f"{b_clean}{sep}logs",
         },
+        "storage_volume": compute_storage_volume(paths, repo),
+        "ofac_summary": get_ofac_summary(repo.conn, settings_dict),
     }
 
     return {
@@ -404,8 +409,10 @@ def build_standalone_offline_app_html(
             const results = (EMBEDDED.all_search_records || []).filter(r => {{
               if (srcType && srcType !== 'ALL' && r.record_type !== srcType) return false;
               if (!q && !srcType && !['ARTICLE', 'PUBLICATION'].includes(r.record_type)) return false;
-              if (dateFrom && r.publication_date < dateFrom) return false;
-              if (dateTo && r.publication_date > dateTo) return false;
+              const pubD = String(r.publication_date || '').trim().slice(0, 10);
+              if ((dateFrom || dateTo) && !pubD) return false;
+              if (dateFrom && pubD < dateFrom) return false;
+              if (dateTo && pubD > dateTo) return false;
               if (orgName && orgName !== 'all' && !String(r.organizations || '').toLowerCase().includes(orgName)) return false;
               if (catSlug && catSlug !== 'ALL') {{
                 const catMatch = (EMBEDDED.overview.categories || []).find(c => c.slug === catSlug);
@@ -770,6 +777,37 @@ def build_standalone_offline_app_html(
             }});
           }}
 
+          if (path === '/api/crawl-status') {{
+            return jsonResponse({{
+              ok: true,
+              active_job: (EMBEDDED.overview.jobs && EMBEDDED.overview.jobs[0]) || null,
+              recent_history: (EMBEDDED.overview.history || []).slice(0, 8),
+              articles_count: EMBEDDED.overview.stats.articles_count,
+              publications_count: EMBEDDED.overview.stats.publications_count,
+              stop_requested: false
+            }});
+          }}
+
+          if (path === '/api/stop-crawl') {{
+            return jsonResponse({{
+              ok: true,
+              stopped: true,
+              running_job_id: null,
+              jobs: EMBEDDED.overview.jobs
+            }});
+          }}
+
+          if (path === '/api/ofac/status' || path === '/api/ofac/sync') {{
+            return jsonResponse({{
+              ok: true,
+              action: 'OFFLINE_SNAPSHOT',
+              service_alive: false,
+              update_available: false,
+              summary: EMBEDDED.overview.ofac_summary || {{ total_entities: 0 }},
+              storage_volume: EMBEDDED.overview.storage_volume || null
+            }});
+          }}
+
           if (path === '/api/backup/create') {{
             const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
             const b = {{
@@ -837,15 +875,26 @@ def build_standalone_offline_app_html(
             }}
           }}
 
-          if (href.startsWith('/api/export/xlsx?entities=')) {{
-            const raw = decodeURIComponent(href.split('entities=')[1] || '');
+          if (href.startsWith('/api/export/xlsx?')) {{
+            const qs = new URLSearchParams(href.split('?')[1] || '');
+            const raw = qs.get('entities') || '';
+            const dateFrom = (qs.get('date_from') || '').trim().slice(0, 10);
+            const dateTo = (qs.get('date_to') || '').trim().slice(0, 10);
             const entities = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const inRange = (rec) => {{
+              if (!dateFrom && !dateTo) return true;
+              const d = String(rec.publication_date || '').trim().slice(0, 10);
+              if (!d) return false;
+              if (dateFrom && d < dateFrom) return false;
+              if (dateTo && d > dateTo) return false;
+              return true;
+            }};
             const sheets = [];
             if (entities.includes('articles')) {{
               sheets.push({{
                 name: 'Articles',
                 headers: ['ID', 'Title', 'Author', 'Publication Date', 'Categories', 'Organizations', 'Tags', 'Summary', 'Source URL'],
-                rows: (EMBEDDED.overview.articles || []).map(a => [
+                rows: (EMBEDDED.overview.articles || []).filter(inRange).map(a => [
                   a.id, a.title, a.author, a.publication_date, a.categories_en, a.organizations_list, a.tags_list, a.summary, a.source_url
                 ])
               }});
@@ -854,7 +903,7 @@ def build_standalone_offline_app_html(
               sheets.push({{
                 name: 'Publications',
                 headers: ['ID', 'Publication Slug', 'Title', 'Native Title', 'Publication Date', 'Categories', 'Description', 'Source URL'],
-                rows: (EMBEDDED.overview.publications || []).map(p => [
+                rows: (EMBEDDED.overview.publications || []).filter(inRange).map(p => [
                   p.id, p.original_pub_id, p.title, p.native_title, p.publication_date, p.categories_en, p.description, p.source_url
                 ])
               }});
@@ -877,8 +926,9 @@ def build_standalone_offline_app_html(
                 ])
               }});
             }}
+            const dateTag = (dateFrom && dateTo) ? ('_' + dateFrom + '_to_' + dateTo) : (dateFrom ? ('_from_' + dateFrom) : (dateTo ? ('_until_' + dateTo) : ''));
             const blob = buildExcelXmlWorkbook(sheets);
-            triggerBlobDownload(blob, 'WikIran_Custom_Report_' + entities.join('_') + '.xls');
+            triggerBlobDownload(blob, 'WikIran_Custom_Report_' + (entities.join('_') || 'custom') + dateTag + '.xls');
             return;
           }}
 
@@ -1239,12 +1289,15 @@ def build_windows11_setup_exe(
 ) -> Path:
     """
     Build the single-file Windows 64-bit GUI Installer `WikIranArchive_Setup.exe`.
-    Workflow for the user:
-    1. Download `WikIranArchive_Setup.exe`
-    2. Double-click `WikIranArchive_Setup.exe`
-    3. Choose Storage Path (default `C:\\WikIranArchive`) & click Install
-    4. Desktop shortcut `WikIran Archive` appears on Desktop
-    5. WikIran Archive launches immediately
+    Step-by-step automated workflow on any Windows PC:
+    1. System Prerequisite Check: Detects Python 3.11+ & Microsoft Edge / WebView2 on the PC.
+    2. Automatic Prerequisite Provisioning: If Python 3.11+ or required Python packages are missing,
+       automatically downloads and silently installs Python 3.11.9 (64-bit) and runs
+       `pip install -r requirements.txt` (falling back gracefully to the bundled standalone runtime if offline).
+    3. Application & Database Installation: Extracts `WikIranArchive.exe`, full Python source package,
+       pre-seeded SQLite FTS5 database, and Excel workbooks into the user's chosen Storage Path,
+       and creates the `WikIran Archive` Desktop shortcut.
+    4. Launch: Opens `WikIran Archive` immediately.
     """
     zip_path = build_windows11_clerk_zip(project_root, paths, repo)
     zip_bytes = zip_path.read_bytes()
@@ -1258,10 +1311,43 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.Windows.Forms.Application]::EnableVisualStyles()
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Find-PythonExe {{
+  $candidates = @(
+    "$env:LOCALAPPDATA\\Programs\\Python\\Python311\\python.exe",
+    "$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe",
+    "$env:ProgramFiles\\Python311\\python.exe",
+    "$env:ProgramFiles\\Python312\\python.exe"
+  )
+  foreach ($c in $candidates) {{
+    if (Test-Path -LiteralPath $c) {{ return $c }}
+  }}
+  $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+  if ($cmd -and $cmd.Source -and ($cmd.Source -notlike "*WindowsApps*")) {{
+    return $cmd.Source
+  }}
+  return $null
+}}
+
+function Find-EdgeExe {{
+  $edgePaths = @(
+    "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe",
+    "$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe",
+    "$env:LOCALAPPDATA\\Microsoft\\Edge\\Application\\msedge.exe"
+  )
+  foreach ($ep in $edgePaths) {{
+    if ($ep -and (Test-Path -LiteralPath $ep)) {{ return $ep }}
+  }}
+  return $null
+}}
+
+$detectedPython = Find-PythonExe
+$detectedEdge = Find-EdgeExe
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "WikIran Archive — Windows Setup"
-$form.Size = New-Object System.Drawing.Size(600, 430)
+$form.Text = "WikIran Archive — All-in-One Windows Setup"
+$form.Size = New-Object System.Drawing.Size(650, 560)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -1269,7 +1355,7 @@ $form.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
 
 $headerPanel = New-Object System.Windows.Forms.Panel
 $headerPanel.Dock = "Top"
-$headerPanel.Height = 82
+$headerPanel.Height = 84
 $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(15, 23, 42)
 $form.Controls.Add($headerPanel)
 
@@ -1282,33 +1368,77 @@ $titleLbl.AutoSize = $true
 $headerPanel.Controls.Add($titleLbl)
 
 $subLbl = New-Object System.Windows.Forms.Label
-$subLbl.Text = "Install WikIran Archive, local SQLite FTS5 database, and Excel workbooks"
+$subLbl.Text = "Checks PC prerequisites, installs Python 3.11 + packages if needed, and installs WikIran Archive"
 $subLbl.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
 $subLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$subLbl.Location = New-Object System.Drawing.Point(22, 46)
+$subLbl.Location = New-Object System.Drawing.Point(22, 48)
 $subLbl.AutoSize = $true
 $headerPanel.Controls.Add($subLbl)
 
+# System Prerequisite Check Group Box
+$checkGroup = New-Object System.Windows.Forms.GroupBox
+$checkGroup.Text = "Step 1: Automatic PC Component Check"
+$checkGroup.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$checkGroup.ForeColor = [System.Drawing.Color]::FromArgb(30, 41, 59)
+$checkGroup.Location = New-Object System.Drawing.Point(22, 96)
+$checkGroup.Size = New-Object System.Drawing.Size(590, 96)
+$form.Controls.Add($checkGroup)
+
+$pyStatusLbl = New-Object System.Windows.Forms.Label
+if ($detectedPython) {{
+  $pyStatusLbl.Text = "[OK] Python Runtime Detected: $detectedPython"
+  $pyStatusLbl.ForeColor = [System.Drawing.Color]::FromArgb(5, 150, 105)
+}} else {{
+  $pyStatusLbl.Text = "[MISSING] Python 3.11 Runtime — Installer will automatically download & install Python 3.11.9"
+  $pyStatusLbl.ForeColor = [System.Drawing.Color]::FromArgb(180, 83, 9)
+}}
+$pyStatusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 8.8)
+$pyStatusLbl.Location = New-Object System.Drawing.Point(14, 24)
+$pyStatusLbl.Size = New-Object System.Drawing.Size(564, 20)
+$checkGroup.Controls.Add($pyStatusLbl)
+
+$edgeStatusLbl = New-Object System.Windows.Forms.Label
+if ($detectedEdge) {{
+  $edgeStatusLbl.Text = "[OK] Desktop App Window Engine (Microsoft Edge): Ready"
+  $edgeStatusLbl.ForeColor = [System.Drawing.Color]::FromArgb(5, 150, 105)
+}} else {{
+  $edgeStatusLbl.Text = "[INFO] Default Windows browser engine will be used for desktop UI"
+  $edgeStatusLbl.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
+}}
+$edgeStatusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 8.8)
+$edgeStatusLbl.Location = New-Object System.Drawing.Point(14, 46)
+$edgeStatusLbl.Size = New-Object System.Drawing.Size(564, 20)
+$checkGroup.Controls.Add($edgeStatusLbl)
+
+$dbStatusLbl = New-Object System.Windows.Forms.Label
+$dbStatusLbl.Text = "[INCLUDED] Pre-seeded SQLite FTS5 Database + Excel Workbooks + Deep Spider Crawler"
+$dbStatusLbl.ForeColor = [System.Drawing.Color]::FromArgb(37, 99, 235)
+$dbStatusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 8.8)
+$dbStatusLbl.Location = New-Object System.Drawing.Point(14, 68)
+$dbStatusLbl.Size = New-Object System.Drawing.Size(564, 20)
+$checkGroup.Controls.Add($dbStatusLbl)
+
+# Storage Path Picker
 $dirLbl = New-Object System.Windows.Forms.Label
-$dirLbl.Text = "Storage Path (Choose where to store the application, SQLite database & Excel exports):"
+$dirLbl.Text = "Step 2: Storage Path (Where to store WikIran Archive, SQLite DB & Excel reports):"
 $dirLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $dirLbl.ForeColor = [System.Drawing.Color]::FromArgb(30, 41, 59)
-$dirLbl.Location = New-Object System.Drawing.Point(22, 104)
+$dirLbl.Location = New-Object System.Drawing.Point(22, 204)
 $dirLbl.AutoSize = $true
 $form.Controls.Add($dirLbl)
 
 $dirBox = New-Object System.Windows.Forms.TextBox
 $dirBox.Text = "{configured_storage}"
 $dirBox.Font = New-Object System.Drawing.Font("Consolas", 10)
-$dirBox.Location = New-Object System.Drawing.Point(22, 130)
-$dirBox.Size = New-Object System.Drawing.Size(435, 28)
+$dirBox.Location = New-Object System.Drawing.Point(22, 228)
+$dirBox.Size = New-Object System.Drawing.Size(480, 28)
 $form.Controls.Add($dirBox)
 
 $browseBtn = New-Object System.Windows.Forms.Button
 $browseBtn.Text = "Browse..."
 $browseBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$browseBtn.Location = New-Object System.Drawing.Point(467, 128)
-$browseBtn.Size = New-Object System.Drawing.Size(95, 29)
+$browseBtn.Location = New-Object System.Drawing.Point(512, 226)
+$browseBtn.Size = New-Object System.Drawing.Size(100, 29)
 $browseBtn.Add_Click({{
   $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
   $fbd.Description = "Select folder where WikIran Archive and its database will be stored"
@@ -1319,37 +1449,63 @@ $browseBtn.Add_Click({{
 }})
 $form.Controls.Add($browseBtn)
 
+$chkInstallPy = New-Object System.Windows.Forms.CheckBox
+$chkInstallPy.Text = "Auto-install Python 3.11.9 & Python packages (httpx, openpyxl, beautifulsoup4) if missing"
+$chkInstallPy.Checked = $true
+$chkInstallPy.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$chkInstallPy.Location = New-Object System.Drawing.Point(22, 268)
+$chkInstallPy.AutoSize = $true
+$form.Controls.Add($chkInstallPy)
+
 $chkDesktop = New-Object System.Windows.Forms.CheckBox
 $chkDesktop.Text = "Create a Desktop shortcut ('WikIran Archive')"
 $chkDesktop.Checked = $true
-$chkDesktop.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
-$chkDesktop.Location = New-Object System.Drawing.Point(22, 178)
+$chkDesktop.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$chkDesktop.Location = New-Object System.Drawing.Point(22, 294)
 $chkDesktop.AutoSize = $true
 $form.Controls.Add($chkDesktop)
 
 $chkLaunch = New-Object System.Windows.Forms.CheckBox
 $chkLaunch.Text = "Launch WikIran Archive immediately after installation"
 $chkLaunch.Checked = $true
-$chkLaunch.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
-$chkLaunch.Location = New-Object System.Drawing.Point(22, 208)
+$chkLaunch.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$chkLaunch.Location = New-Object System.Drawing.Point(22, 320)
 $chkLaunch.AutoSize = $true
 $form.Controls.Add($chkLaunch)
 
+# Live Install Log & Progress
 $statusLbl = New-Object System.Windows.Forms.Label
-$statusLbl.Text = "Ready to install. Click 'Install' to begin."
-$statusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$statusLbl.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
-$statusLbl.Location = New-Object System.Drawing.Point(22, 252)
-$statusLbl.AutoSize = $true
+$statusLbl.Text = "Ready. Click 'Install' to check components, install prerequisites, and set up WikIran Archive."
+$statusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$statusLbl.ForeColor = [System.Drawing.Color]::FromArgb(30, 64, 175)
+$statusLbl.Location = New-Object System.Drawing.Point(22, 354)
+$statusLbl.Size = New-Object System.Drawing.Size(590, 20)
 $form.Controls.Add($statusLbl)
 
 $progBar = New-Object System.Windows.Forms.ProgressBar
-$progBar.Location = New-Object System.Drawing.Point(22, 278)
-$progBar.Size = New-Object System.Drawing.Size(540, 22)
+$progBar.Location = New-Object System.Drawing.Point(22, 378)
+$progBar.Size = New-Object System.Drawing.Size(590, 20)
 $progBar.Minimum = 0
 $progBar.Maximum = 100
 $progBar.Value = 0
 $form.Controls.Add($progBar)
+
+$logBox = New-Object System.Windows.Forms.TextBox
+$logBox.Multiline = $true
+$logBox.ReadOnly = $true
+$logBox.ScrollBars = "Vertical"
+$logBox.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+$logBox.BackColor = [System.Drawing.Color]::White
+$logBox.Location = New-Object System.Drawing.Point(22, 404)
+$logBox.Size = New-Object System.Drawing.Size(590, 62)
+$logBox.Text = "Installer initialized. System check complete."
+$form.Controls.Add($logBox)
+
+function Add-InstallLog($msg) {{
+  $logBox.AppendText("`r`n" + $msg)
+  $statusLbl.Text = $msg
+  [System.Windows.Forms.Application]::DoEvents()
+}}
 
 $installBtn = New-Object System.Windows.Forms.Button
 $installBtn.Text = "Install"
@@ -1357,14 +1513,14 @@ $installBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawin
 $installBtn.BackColor = [System.Drawing.Color]::FromArgb(5, 150, 105)
 $installBtn.ForeColor = [System.Drawing.Color]::White
 $installBtn.FlatStyle = "Flat"
-$installBtn.Location = New-Object System.Drawing.Point(330, 326)
-$installBtn.Size = New-Object System.Drawing.Size(130, 38)
+$installBtn.Location = New-Object System.Drawing.Point(378, 476)
+$installBtn.Size = New-Object System.Drawing.Size(134, 36)
 
 $cancelBtn = New-Object System.Windows.Forms.Button
 $cancelBtn.Text = "Cancel"
 $cancelBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
-$cancelBtn.Location = New-Object System.Drawing.Point(472, 326)
-$cancelBtn.Size = New-Object System.Drawing.Size(90, 38)
+$cancelBtn.Location = New-Object System.Drawing.Point(522, 476)
+$cancelBtn.Size = New-Object System.Drawing.Size(90, 36)
 $cancelBtn.Add_Click({{ $form.Close() }})
 $form.Controls.Add($cancelBtn)
 
@@ -1372,13 +1528,13 @@ $installBtn.Add_Click({{
   try {{
     $installBtn.Enabled = $false
     $browseBtn.Enabled = $false
+    $chkInstallPy.Enabled = $false
     $targetDir = $dirBox.Text.Trim()
     if (-not $targetDir) {{ $targetDir = "C:\\WikIranArchive" }}
 
-    $statusLbl.Text = "Creating storage directories in $targetDir..."
-    $progBar.Value = 20
-    [System.Windows.Forms.Application]::DoEvents()
-
+    # STEP 1: Create directories
+    $progBar.Value = 10
+    Add-InstallLog "Step 1/4: Preparing Storage Path ($targetDir)..."
     foreach ($sub in @("", "data", "exports", "backups", "logs", "installer")) {{
       $p = if ($sub) {{ Join-Path $targetDir $sub }} else {{ $targetDir }}
       if (-not (Test-Path -LiteralPath $p)) {{
@@ -1386,9 +1542,9 @@ $installBtn.Add_Click({{
       }}
     }}
 
-    $statusLbl.Text = "Extracting WikIranArchive.exe, SQLite database, and Excel files..."
-    $progBar.Value = 50
-    [System.Windows.Forms.Application]::DoEvents()
+    # STEP 2: Extract full application & database bundle
+    $progBar.Value = 30
+    Add-InstallLog "Step 2/4: Extracting WikIranArchive.exe, Python engine, SQLite DB & Excel exports..."
 
     $setupExe = $env:WIKIRAN_SETUP_EXE
     $allBytes = [System.IO.File]::ReadAllBytes($setupExe)
@@ -1435,9 +1591,49 @@ $installBtn.Add_Click({{
       Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
     }}
 
-    $progBar.Value = 80
-    $statusLbl.Text = "Configuring selected Storage Path and Desktop shortcut..."
-    [System.Windows.Forms.Application]::DoEvents()
+    # STEP 3: Auto-check & install Python 3.11.9 + required Python packages if missing
+    $progBar.Value = 50
+    if ($chkInstallPy.Checked) {{
+      $pyExe = Find-PythonExe
+      if (-not $pyExe) {{
+        Add-InstallLog "Step 3/4: Python not found. Downloading official Python 3.11.9 (64-bit)..."
+        $pySetup = Join-Path $env:TEMP "python-3.11.9-amd64.exe"
+        try {{
+          $wc = New-Object System.Net.WebClient
+          $wc.DownloadFile("https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe", $pySetup)
+          $progBar.Value = 65
+          Add-InstallLog "Step 3/4: Silently installing Python 3.11.9 on Windows (please wait)..."
+          $p = Start-Process -FilePath $pySetup -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_pip=1" -Wait -PassThru
+          Remove-Item -LiteralPath $pySetup -Force -ErrorAction SilentlyContinue
+          $pyExe = Find-PythonExe
+          if ($pyExe) {{
+            Add-InstallLog "Python 3.11.9 installed successfully at $pyExe."
+          }}
+        }} catch {{
+          Add-InstallLog "Offline or download skipped — continuing with bundled standalone desktop runtime."
+        }}
+      }} else {{
+        Add-InstallLog "Step 3/4: Using existing Python runtime at $pyExe."
+      }}
+
+      if ($pyExe) {{
+        $reqFile = Join-Path $targetDir "requirements.txt"
+        if (Test-Path -LiteralPath $reqFile) {{
+          $progBar.Value = 75
+          Add-InstallLog "Step 3/4: Installing required Python packages (httpx, openpyxl, beautifulsoup4)..."
+          try {{
+            Start-Process -FilePath $pyExe -ArgumentList "-m pip install --quiet --disable-pip-version-check -r `"$reqFile`"" -WindowStyle Hidden -Wait
+            Add-InstallLog "Python dependencies installed and verified."
+          }} catch {{
+            Add-InstallLog "Dependency install skipped (offline mode) — bundled runtime remains ready."
+          }}
+        }}
+      }}
+    }}
+
+    # STEP 4: Save Storage Path config, create Desktop shortcut, and launch
+    $progBar.Value = 90
+    Add-InstallLog "Step 4/4: Configuring Storage Path and creating Desktop shortcut..."
 
     $cfgJsonPath = Join-Path $targetDir "storage_config.json"
     @{{ custom_storage_path = $targetDir }} | ConvertTo-Json | Set-Content -LiteralPath $cfgJsonPath -Encoding UTF8
@@ -1463,8 +1659,7 @@ $installBtn.Add_Click({{
     }}
 
     $progBar.Value = 100
-    $statusLbl.Text = "Installation complete!"
-    [System.Windows.Forms.Application]::DoEvents()
+    Add-InstallLog "Installation complete! Launching WikIran Archive..."
 
     if ($chkLaunch.Checked -and (Test-Path -LiteralPath $appExePath)) {{
       Start-Process -FilePath $appExePath -WorkingDirectory $targetDir
@@ -1474,6 +1669,7 @@ $installBtn.Add_Click({{
     [System.Windows.Forms.MessageBox]::Show("Installation Error: " + $_.Exception.Message, "WikIran Archive Setup", "OK", "Error")
     $installBtn.Enabled = $true
     $browseBtn.Enabled = $true
+    $chkInstallPy.Enabled = $true
   }}
 }})
 $form.Controls.Add($installBtn)

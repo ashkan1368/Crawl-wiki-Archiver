@@ -378,6 +378,36 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
             p.publication_date AS publication_date
         FROM file_inventory fi
         LEFT JOIN publications p ON p.id = fi.publication_id;
+
+        CREATE TABLE IF NOT EXISTS ofac_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ent_num INTEGER NOT NULL,
+            list_source TEXT NOT NULL,
+            sdn_name TEXT NOT NULL,
+            sdn_type TEXT NOT NULL DEFAULT '',
+            programs TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            call_sign TEXT NOT NULL DEFAULT '',
+            vessel_type TEXT NOT NULL DEFAULT '',
+            tonnage TEXT NOT NULL DEFAULT '',
+            grt TEXT NOT NULL DEFAULT '',
+            vessel_flag TEXT NOT NULL DEFAULT '',
+            vessel_owner TEXT NOT NULL DEFAULT '',
+            remarks TEXT NOT NULL DEFAULT '',
+            aliases_text TEXT NOT NULL DEFAULT '',
+            addresses_text TEXT NOT NULL DEFAULT '',
+            countries_text TEXT NOT NULL DEFAULT '',
+            publication_id INTEGER,
+            date_published TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            retrieved_at TEXT NOT NULL,
+            UNIQUE(ent_num, list_source)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ofac_list_source ON ofac_entities(list_source);
+        CREATE INDEX IF NOT EXISTS idx_ofac_sdn_name ON ofac_entities(sdn_name);
+        CREATE INDEX IF NOT EXISTS idx_ofac_programs ON ofac_entities(programs);
+        CREATE INDEX IF NOT EXISTS idx_ofac_countries ON ofac_entities(countries_text);
         """
     )
     conn.execute("PRAGMA foreign_keys = ON;")

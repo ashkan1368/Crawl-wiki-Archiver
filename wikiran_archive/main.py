@@ -18,6 +18,7 @@ from typing import Any
 
 from .backup.manager import BackupManager
 from .collector.engine import CollectionEngine
+from .collector.ofac_sync import get_ofac_summary, sync_ofac_lists
 from .collector.reconnaissance import generate_reconnaissance_markdown, run_reconnaissance
 from .collector.scheduler import ScheduledCollectionRunner
 from .config.settings import AppPaths, resolve_app_paths
@@ -84,6 +85,109 @@ def _resolve_configured_paths_dict(paths: AppPaths, repo: ArchiveRepository) -> 
     }
 
 
+def format_bytes_human(num_bytes: int) -> str:
+    """Format a byte count into a readable KB/MB/GB string."""
+    size = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} B"
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def _dir_size_bytes(directory: Path, exclude_names: set[str] | None = None) -> int:
+    if not directory.exists() or not directory.is_dir():
+        return 0
+    total = 0
+    for f in directory.rglob("*"):
+        if f.is_file():
+            if exclude_names and f.name in exclude_names:
+                continue
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def compute_storage_volume(paths: AppPaths, repo: ArchiveRepository) -> dict[str, Any]:
+    """Compute real on-disk storage footprint (bytes) and total indexed data volume."""
+    db_bytes = 0
+    for candidate in (
+        paths.db_path,
+        paths.db_path.with_name(paths.db_path.name + "-wal"),
+        paths.db_path.with_name(paths.db_path.name + "-shm"),
+    ):
+        if candidate.exists() and candidate.is_file():
+            try:
+                db_bytes += candidate.stat().st_size
+            except OSError:
+                pass
+
+    backups_bytes = _dir_size_bytes(paths.backups_dir)
+    exports_bytes = _dir_size_bytes(paths.exports_dir)
+    logs_bytes = _dir_size_bytes(paths.logs_dir)
+    total_bytes = db_bytes + backups_bytes + exports_bytes + logs_bytes
+
+    stats = repo.get_dashboard_stats()
+    try:
+        csv_rows_count = int(repo.conn.execute("SELECT COUNT(*) FROM imported_csv_rows;").fetchone()[0])
+    except Exception:
+        csv_rows_count = 0
+    try:
+        fts_indexed_count = int(repo.conn.execute("SELECT COUNT(*) FROM fts_archive;").fetchone()[0])
+    except Exception:
+        fts_indexed_count = 0
+    try:
+        ofac_entities_count = int(repo.conn.execute("SELECT COUNT(*) FROM ofac_entities;").fetchone()[0])
+    except Exception:
+        ofac_entities_count = 0
+    try:
+        text_bytes = int(
+            repo.conn.execute(
+                """
+                SELECT
+                    COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(summary AS BLOB)) + LENGTH(CAST(editorial_content AS BLOB))) FROM articles), 0)
+                  + COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(description AS BLOB))) FROM publications), 0)
+                  + COALESCE((SELECT SUM(LENGTH(CAST(searchable_text AS BLOB))) FROM imported_csv_rows), 0)
+                  + COALESCE((SELECT SUM(LENGTH(CAST(sdn_name AS BLOB)) + LENGTH(CAST(aliases_text AS BLOB)) + LENGTH(CAST(addresses_text AS BLOB)) + LENGTH(CAST(remarks AS BLOB))) FROM ofac_entities), 0)
+                """
+            ).fetchone()[0]
+        )
+    except Exception:
+        text_bytes = 0
+
+    total_records = (
+        stats["articles_count"]
+        + stats["publications_count"]
+        + stats["organizations_count"]
+        + stats["entities_count"]
+        + stats["file_inventory_count"]
+        + csv_rows_count
+        + ofac_entities_count
+    )
+
+    return {
+        "db_bytes": db_bytes,
+        "backups_bytes": backups_bytes,
+        "exports_bytes": exports_bytes,
+        "logs_bytes": logs_bytes,
+        "text_bytes": text_bytes,
+        "total_bytes": total_bytes,
+        "db_size_label": format_bytes_human(db_bytes),
+        "total_size_label": format_bytes_human(total_bytes),
+        "text_size_label": format_bytes_human(text_bytes),
+        "total_records": int(total_records),
+        "articles_count": stats["articles_count"],
+        "publications_count": stats["publications_count"],
+        "csv_rows_count": csv_rows_count,
+        "ofac_entities_count": ofac_entities_count,
+        "fts_indexed_count": fts_indexed_count,
+    }
+
+
 def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | Path | None = None) -> dict[str, Any]:
     """Execute a structured action against the real Python SQLite/FTS5 backend."""
     paths, repo = ensure_initialized(custom_dir)
@@ -117,6 +221,8 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
                 "integrity": {"verified": ok, "message": msg},
                 "logs": read_diagnostic_logs(paths.logs_dir, max_lines=100),
                 "paths": _resolve_configured_paths_dict(paths, repo),
+                "storage_volume": compute_storage_volume(paths, repo),
+                "ofac_summary": get_ofac_summary(repo.conn, repo.get_settings()),
             }
 
         if action == "csv_import":
@@ -219,6 +325,45 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
                 "history": repo.list_collection_history(limit=60),
             }
 
+        if action == "crawl_status":
+            jobs = repo.list_collection_jobs()
+            latest_job = jobs[0] if jobs else None
+            recent_history = repo.list_collection_history(limit=8)
+            stats = repo.get_dashboard_stats()
+            stop_flag = repo.get_settings().get("stop_crawl_requested", "false") == "true"
+            return {
+                "ok": True,
+                "active_job": latest_job,
+                "recent_history": recent_history,
+                "articles_count": stats["articles_count"],
+                "publications_count": stats["publications_count"],
+                "stop_requested": stop_flag,
+                "storage_volume": compute_storage_volume(paths, repo),
+            }
+
+        if action == "ofac_status":
+            return {
+                "ok": True,
+                "summary": get_ofac_summary(repo.conn, repo.get_settings()),
+                "storage_volume": compute_storage_volume(paths, repo),
+            }
+
+        if action == "ofac_sync":
+            force_flag = bool(payload.get("force", False))
+            check_only_flag = bool(payload.get("check_only", False))
+            result = sync_ofac_lists(
+                repo,
+                force=force_flag,
+                check_only=check_only_flag,
+                exports_dir=paths.exports_dir,
+            )
+            return {
+                **result,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "jobs": repo.list_collection_jobs(),
+                "history": repo.list_collection_history(limit=60),
+            }
+
         if action == "stop_crawl":
             repo.set_setting("stop_crawl_requested", "true")
             # Also mark any currently RUNNING job as INTERRUPTED if its process already exited
@@ -254,9 +399,13 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
         if action == "export":
             fmt = payload.get("format", "xlsx").lower()
             entities = payload.get("entities")
+            date_from = payload.get("date_from")
+            date_to = payload.get("date_to")
             controller = DesktopController(paths)
             try:
-                return controller.run_clerk_export(fmt, entities=entities)
+                return controller.run_clerk_export(
+                    fmt, entities=entities, date_from=date_from, date_to=date_to
+                )
             finally:
                 controller.close()
 

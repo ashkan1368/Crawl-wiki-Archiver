@@ -45,11 +45,13 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN '[' || csv_row_content.dataset_name || ' — Row #' || csv_row_content.row_number || ']'
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_title, 'Archive File') || ' — ' || file_metadata.data_type
             WHEN fts_archive.record_type = 'ENTITY' THEN o.name || ' (' || COALESCE(NULLIF(o.acronym, ''), o.org_type) || ')'
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN ofac.sdn_name
             ELSE fts_archive.title
         END AS title,
         CASE
             WHEN fts_archive.record_type = 'PUBLICATION' THEN COALESCE(p.native_title, '')
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(o.native_name, '')
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(ofac.aliases_text, '')
             ELSE ''
         END AS native_title,
         CASE
@@ -58,6 +60,10 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN csv_row_content.searchable_text
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN file_metadata.reported_count_label || ' | ' || COALESCE(file_metadata.safety_policy_applied, '')
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(o.description, fts_archive.summary)
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN
+                'OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.sdn_type, ''), 'entity') || ')'
+                || CASE WHEN ofac.programs != '' THEN ' · Programs: ' || ofac.programs ELSE '' END
+                || CASE WHEN ofac.countries_text != '' THEN ' · Countries: ' || ofac.countries_text ELSE '' END
             ELSE fts_archive.summary
         END AS short_description,
         CASE
@@ -66,6 +72,12 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN csv_row_content.searchable_text
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN 'Inventory Type: ' || file_metadata.data_type || char(10) || 'Details: ' || file_metadata.reported_count_label || char(10) || 'Note: ' || COALESCE(file_metadata.safety_policy_applied, '')
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(o.description, '') || char(10) || 'Linked Entities: ' || COALESCE(fts_archive.entity_names, 'N/A')
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN
+                TRIM(
+                    CASE WHEN ofac.aliases_text != '' THEN 'Aliases (AKA): ' || ofac.aliases_text || char(10) ELSE '' END
+                    || CASE WHEN ofac.addresses_text != '' THEN 'Addresses: ' || ofac.addresses_text || char(10) ELSE '' END
+                    || CASE WHEN ofac.remarks != '' THEN 'Remarks: ' || ofac.remarks ELSE '' END
+                )
             ELSE fts_archive.editorial_content
         END AS editorial_content,
         CASE
@@ -74,6 +86,7 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN SUBSTR(csv_row_content.retrieved_at, 1, 10)
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_date, SUBSTR(file_metadata.retrieved_at, 1, 10))
             WHEN fts_archive.record_type = 'ENTITY' THEN SUBSTR(o.retrieved_at, 1, 10)
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(NULLIF(ofac.date_published, ''), SUBSTR(ofac.retrieved_at, 1, 10))
             ELSE fts_archive.publication_date
         END AS publication_date,
         CASE
@@ -92,6 +105,7 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN 'CSV Excel Table (' || csv_row_content.original_filename || ')'
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN 'File & Document Inventory'
             WHEN fts_archive.record_type = 'ENTITY' THEN 'Organization / ' || o.org_type
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.programs, ''), 'SANCTIONS') || ')'
             ELSE 'General Research'
         END AS category_en,
         CASE
@@ -110,6 +124,7 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN 'جدول اکسل CSV (' || csv_row_content.original_filename || ')'
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN 'فهرست فایل‌ها و اسناد'
             WHEN fts_archive.record_type = 'ENTITY' THEN 'سازمان و نهاد (' || COALESCE(NULLIF(o.native_name, ''), o.org_type) || ')'
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'تحریم اوفک OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.programs, ''), 'تحریم') || ')'
             ELSE 'پژوهش عمومی'
         END AS category_fa,
         CASE
@@ -135,6 +150,7 @@ WITH unified_joined_records AS (
                 WHERE ae.article_id = a.id
             ), '')
             WHEN fts_archive.record_type = 'ENTITY' THEN o.name
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(NULLIF(ofac.countries_text, ''), ofac.sdn_type)
             ELSE ''
         END AS organizations,
         CASE
@@ -148,6 +164,7 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN 'CSV Excel Table'
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN file_metadata.data_type
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(NULLIF(o.acronym, ''), o.org_type)
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN ofac.programs
             ELSE fts_archive.tag_names
         END AS tags,
         CASE
@@ -156,6 +173,7 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'CSV_ROW' THEN csv_row_content.dataset_name
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_title, 'File Inventory')
             WHEN fts_archive.record_type = 'ENTITY' THEN 'WikIran Organizations & Entities'
+            WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'U.S. Treasury OFAC ' || ofac.list_source || ' List'
             ELSE 'WikIran Archive'
         END AS source_name,
         COALESCE(
@@ -164,6 +182,7 @@ WITH unified_joined_records AS (
             csv_row_content.source_url,
             file_metadata.source_url,
             o.source_url,
+            ofac.source_url,
             fts_archive.source_url
         ) AS source_url,
         COALESCE(
@@ -172,6 +191,7 @@ WITH unified_joined_records AS (
             csv_row_content.extraction_status,
             file_metadata.extraction_status,
             o.extraction_status,
+            CASE WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'OFAC_DESIGNATED' ELSE NULL END,
             'VERIFIED'
         ) AS extraction_status,
         COALESCE(
@@ -180,6 +200,7 @@ WITH unified_joined_records AS (
             csv_row_content.retrieved_at,
             file_metadata.retrieved_at,
             o.retrieved_at,
+            ofac.retrieved_at,
             ''
         ) AS retrieved_at,
         COALESCE(
@@ -189,7 +210,14 @@ WITH unified_joined_records AS (
             file_metadata.record_version,
             o.record_version,
             1
-        ) AS record_version
+        ) AS record_version,
+        ofac.ent_num AS ofac_ent_num,
+        COALESCE(ofac.list_source, '') AS ofac_list_source,
+        COALESCE(ofac.sdn_type, '') AS ofac_sdn_type,
+        COALESCE(ofac.programs, '') AS ofac_programs,
+        COALESCE(ofac.aliases_text, '') AS ofac_aliases,
+        COALESCE(ofac.addresses_text, '') AS ofac_addresses,
+        COALESCE(ofac.countries_text, '') AS ofac_countries
     FROM fts_archive
     LEFT JOIN articles a
         ON fts_archive.record_type = 'ARTICLE' AND a.id = CAST(fts_archive.record_id AS INTEGER)
@@ -205,6 +233,8 @@ WITH unified_joined_records AS (
         ON fts_archive.record_type = 'FILE_INVENTORY' AND file_metadata.id = CAST(fts_archive.record_id AS INTEGER)
     LEFT JOIN organizations o
         ON fts_archive.record_type = 'ENTITY' AND o.id = CAST(fts_archive.record_id AS INTEGER)
+    LEFT JOIN ofac_entities ofac
+        ON fts_archive.record_type = 'OFAC_SANCTION' AND ofac.id = CAST(fts_archive.record_id AS INTEGER)
     WHERE {fts_where_clause}
       AND (
           :source_type IS NULL
@@ -221,8 +251,22 @@ WITH unified_joined_records AS (
 SELECT *
 FROM unified_joined_records
 WHERE title IS NOT NULL
-  AND (:date_from IS NULL OR :date_from = '' OR publication_date >= :date_from)
-  AND (:date_to IS NULL OR :date_to = '' OR publication_date <= :date_to)
+  AND (
+      :date_from IS NULL
+      OR :date_from = ''
+      OR (
+          TRIM(COALESCE(publication_date, '')) != ''
+          AND SUBSTR(TRIM(publication_date), 1, 10) >= :date_from
+      )
+  )
+  AND (
+      :date_to IS NULL
+      OR :date_to = ''
+      OR (
+          TRIM(COALESCE(publication_date, '')) != ''
+          AND SUBSTR(TRIM(publication_date), 1, 10) <= :date_to
+      )
+  )
   AND (
       :extraction_status IS NULL
       OR :extraction_status = ''
@@ -241,7 +285,12 @@ WHERE title IS NOT NULL
       OR :organization_name = 'ALL'
       OR LOWER(organizations) LIKE '%' || LOWER(:organization_name) || '%'
   )
-ORDER BY publication_date DESC, fts_rank ASC, id DESC;
+ORDER BY
+    CASE WHEN record_type = 'OFAC_SANCTION' THEN 0 ELSE 1 END ASC,
+    fts_rank ASC,
+    publication_date DESC,
+    id DESC
+LIMIT 600;
 """
 
 
@@ -418,6 +467,13 @@ class ArchiveSearchEngine:
                     "extraction_status": row["extraction_status"],
                     "retrieved_at": row["retrieved_at"] or "",
                     "record_version": int(row["record_version"] or 1),
+                    "ofac_ent_num": int(row["ofac_ent_num"]) if row["ofac_ent_num"] is not None else None,
+                    "ofac_list_source": row["ofac_list_source"] or "",
+                    "ofac_sdn_type": row["ofac_sdn_type"] or "",
+                    "ofac_programs": row["ofac_programs"] or "",
+                    "ofac_aliases": row["ofac_aliases"] or "",
+                    "ofac_addresses": row["ofac_addresses"] or "",
+                    "ofac_countries": row["ofac_countries"] or "",
                 }
             )
         return results

@@ -133,17 +133,42 @@ class ArchiveExporter:
     def __init__(self, repo: ArchiveRepository) -> None:
         self.repo = repo
 
-    def export_excel(self, output_path: str | Path, entities: list[str] | None = None) -> Path:
+    def export_excel(
+        self,
+        output_path: str | Path,
+        entities: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> Path:
         """
         Create an organized Excel (.xlsx) workbook.
         - If `entities` is None or empty, exports the standard 6 sheets:
           Articles, Publications, Organizations, Categories, Sources, Collection Statistics.
         - If `entities` is specified by the Export Report Wizard (e.g. ['articles', 'publications', 'organizations', 'tags']),
           exports only the chosen data entities in the workbook.
+        - If `date_from` and/or `date_to` (YYYY-MM-DD) are specified, filters Articles and Publications
+          by their normalized `publication_date`.
         """
         path = Path(output_path)
         articles = self.repo.list_articles()
         publications = self.repo.list_publications()
+
+        clean_from = (date_from or "").strip()[:10]
+        clean_to = (date_to or "").strip()[:10]
+        if clean_from or clean_to:
+            def _in_date_range(record: dict[str, Any]) -> bool:
+                pub_date = str(record.get("publication_date") or "").strip()[:10]
+                if not pub_date:
+                    return False
+                if clean_from and pub_date < clean_from:
+                    return False
+                if clean_to and pub_date > clean_to:
+                    return False
+                return True
+
+            articles = [a for a in articles if _in_date_range(a)]
+            publications = [p for p in publications if _in_date_range(p)]
+
         organizations = self.repo.list_organizations()
         categories = self.repo.list_categories()
         tags = self.repo.list_tags()
@@ -366,7 +391,81 @@ class ArchiveExporter:
         )
 
         if entities:
-            entity_map = {
+            requested_keys = [key.strip().lower() for key in entities if key.strip()]
+
+            def _build_ofac_sheet(scope: str) -> tuple[str, list[str], list[list[Any]]]:
+                ofac_headers = [
+                    "OFAC ID",
+                    "List Source",
+                    "Primary Name",
+                    "Entity Type",
+                    "Sanctions Programs",
+                    "Aliases (AKA)",
+                    "Countries",
+                    "Addresses",
+                    "Vessel / Call Sign / Flag",
+                    "Remarks & Identifiers",
+                    "Treasury Date Published",
+                    "Official Treasury URL",
+                ]
+                if scope == "ofac_iran":
+                    rows_db = self.repo.conn.execute(
+                        """
+                        SELECT ent_num, list_source, sdn_name, sdn_type, programs,
+                               aliases_text, countries_text, addresses_text,
+                               call_sign, vessel_type, vessel_flag, remarks,
+                               date_published, source_url
+                        FROM ofac_entities
+                        WHERE UPPER(programs) LIKE '%IRAN%'
+                           OR UPPER(programs) LIKE '%IRGC%'
+                           OR UPPER(programs) LIKE '%IFSR%'
+                           OR UPPER(programs) LIKE '%IFCA%'
+                           OR UPPER(programs) LIKE '%FSE-IR%'
+                           OR UPPER(programs) LIKE '%HRIT-IR%'
+                           OR UPPER(countries_text) LIKE '%IRAN%'
+                        ORDER BY sdn_name ASC;
+                        """
+                    ).fetchall()
+                    sheet_title = "OFAC Iran Sanctions"
+                else:
+                    rows_db = self.repo.conn.execute(
+                        """
+                        SELECT ent_num, list_source, sdn_name, sdn_type, programs,
+                               aliases_text, countries_text, addresses_text,
+                               call_sign, vessel_type, vessel_flag, remarks,
+                               date_published, source_url
+                        FROM ofac_entities
+                        ORDER BY list_source ASC, sdn_name ASC;
+                        """
+                    ).fetchall()
+                    sheet_title = "OFAC Full Sanctions"
+
+                formatted_rows: list[list[Any]] = []
+                for r in rows_db:
+                    vessel_meta = " | ".join(
+                        p
+                        for p in (r["vessel_type"], r["call_sign"], r["vessel_flag"])
+                        if p
+                    )
+                    formatted_rows.append(
+                        [
+                            r["ent_num"],
+                            r["list_source"],
+                            r["sdn_name"],
+                            r["sdn_type"],
+                            str(r["programs"] or "").replace("] [", "; "),
+                            r["aliases_text"],
+                            r["countries_text"],
+                            r["addresses_text"],
+                            vessel_meta,
+                            r["remarks"],
+                            r["date_published"],
+                            r["source_url"],
+                        ]
+                    )
+                return (sheet_title, ofac_headers, formatted_rows)
+
+            entity_map: dict[str, tuple[str, list[str], list[list[Any]]]] = {
                 "articles": art_sheet,
                 "publications": pub_sheet,
                 "organizations": org_sheet,
@@ -375,10 +474,13 @@ class ArchiveExporter:
                 "sources": src_sheet,
                 "statistics": stat_sheet,
             }
+            if "ofac_iran" in requested_keys:
+                entity_map["ofac_iran"] = _build_ofac_sheet("ofac_iran")
+            if "ofac_all" in requested_keys:
+                entity_map["ofac_all"] = _build_ofac_sheet("ofac_all")
+
             selected_sheets = [
-                entity_map[key.strip().lower()]
-                for key in entities
-                if key.strip().lower() in entity_map
+                entity_map[key] for key in requested_keys if key in entity_map
             ]
             if selected_sheets:
                 return write_multi_sheet_xlsx(path, selected_sheets)

@@ -79,9 +79,36 @@ async function startServer() {
     }
   });
 
+  app.get('/api/crawl-status', async (_req, res) => {
+    try {
+      const data = await runPythonAction('crawl_status', {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/stop-crawl', async (_req, res) => {
     try {
       const data = await runPythonAction('stop_crawl', {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/ofac/status', async (_req, res) => {
+    try {
+      const data = await runPythonAction('ofac_status', {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/ofac/sync', async (req, res) => {
+    try {
+      const data = await runPythonAction('ofac_sync', req.body || {});
       res.json(data);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
@@ -116,7 +143,15 @@ async function startServer() {
             .map((e) => e.trim().toLowerCase())
             .filter(Boolean)
         : undefined;
-      const data = await runPythonAction('export', { format: fmt, entities });
+      const date_from =
+        typeof req.query.date_from === 'string' && req.query.date_from.trim()
+          ? req.query.date_from.trim()
+          : undefined;
+      const date_to =
+        typeof req.query.date_to === 'string' && req.query.date_to.trim()
+          ? req.query.date_to.trim()
+          : undefined;
+      const data = await runPythonAction('export', { format: fmt, entities, date_from, date_to });
       if (!data.ok || !data.path || !fs.existsSync(data.path)) {
         res.status(500).json({ ok: false, error: 'Export file could not be generated.' });
         return;

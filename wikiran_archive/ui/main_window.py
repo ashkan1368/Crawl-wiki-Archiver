@@ -80,28 +80,51 @@ class DesktopController:
                 "clerk_message": friendly_clerk_message("GENERIC_ERROR", lang),
             }
 
-    def run_clerk_export(self, fmt: str = "xlsx", entities: list[str] | None = None) -> dict[str, Any]:
+    def run_clerk_export(
+        self,
+        fmt: str = "xlsx",
+        entities: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> dict[str, Any]:
         lang = self.get_language()
         try:
+            clean_from = (date_from or "").strip()[:10] or None
+            clean_to = (date_to or "").strip()[:10] or None
             if fmt == "csv":
                 out = self.exporter.export_csv(self.paths.exports_dir / "wikiran_archive_report.csv")
             elif fmt == "json":
                 out = self.exporter.export_json(self.paths.exports_dir / "wikiran_archive_report.json")
             else:
+                date_tag = ""
+                if clean_from and clean_to:
+                    date_tag = f"_{clean_from}_to_{clean_to}"
+                elif clean_from:
+                    date_tag = f"_from_{clean_from}"
+                elif clean_to:
+                    date_tag = f"_until_{clean_to}"
+
                 if entities:
                     clean_keys = [e.strip().lower() for e in entities if e.strip()]
                     suffix = "_".join(clean_keys[:4]) or "custom"
-                    filename = f"wikiran_report_{suffix}.xlsx"
+                    filename = f"wikiran_report_{suffix}{date_tag}.xlsx"
                 else:
                     clean_keys = None
-                    filename = "wikiran_archive_report.xlsx"
-                out = self.exporter.export_excel(self.paths.exports_dir / filename, entities=clean_keys)
+                    filename = f"wikiran_archive_report{date_tag}.xlsx"
+                out = self.exporter.export_excel(
+                    self.paths.exports_dir / filename,
+                    entities=clean_keys,
+                    date_from=clean_from,
+                    date_to=clean_to,
+                )
             return {
                 "ok": True,
                 "clerk_message": friendly_clerk_message("EXPORT_SUCCESS", lang),
                 "path": str(out),
                 "filename": out.name,
                 "entities": entities or ["articles", "publications", "organizations", "categories", "sources", "statistics"],
+                "date_from": clean_from,
+                "date_to": clean_to,
             }
         except Exception as exc:
             self.logger.error("Export failed (%s): %s", fmt, exc)

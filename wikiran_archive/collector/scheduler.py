@@ -171,12 +171,20 @@ class ScheduledCollectionRunner:
             cfg = self.get_schedule_config(repo)
             engine = CollectionEngine(repo, fetcher=fetcher)
             job_summary = engine.run_incremental_update(max_items=cfg.max_items_per_run)
+            ofac_result: dict[str, Any] | None = None
+            if fetcher is None:
+                try:
+                    from .ofac_sync import sync_ofac_lists
+                    ofac_result = sync_ofac_lists(repo, force=False)
+                except Exception as exc:
+                    ofac_result = {"ok": False, "error": str(exc)}
             now_str = utc_now_iso()
             repo.set_setting("schedule_last_run_at", now_str)
             updated_cfg = self.get_schedule_config(repo)
             return {
                 "schedule": asdict(updated_cfg),
                 "job": job_summary,
+                "ofac_sync": ofac_result,
             }
         finally:
             self._is_executing = False

@@ -478,7 +478,66 @@ class TestWikIranArchiveSuite(unittest.TestCase):
         self.assertIn("FILE_INVENTORY", found_types)
         self.assertIn("ENTITY", found_types)
 
+    def test_16_ofac_sanctions_ingestion_and_unified_fts5_search(self) -> None:
+        """Verify U.S. Treasury OFAC SDN & Consolidated CSV ingestion, update check, and unified FTS5 trade screening."""
+        from wikiran_archive.collector.ofac_sync import sync_ofac_lists
+
+        seed_verified_public_archive(self.repo)
+
+        mock_responses = {
+            "https://sanctionslistservice.ofac.treas.gov/alive": (200, "OK"),
+            "https://sanctionslistservice.ofac.treas.gov/sanctions-lists": (200, '["SDN List","Consolidated List"]'),
+            "https://sanctionslistservice.ofac.treas.gov/sanctions-programs": (200, '["IRAN","IRGC","SDGT"]'),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/SDN.CSV": (
+                200,
+                '44510,"SAHARA THUNDER",-0- ,"SDGT] [IFSR",-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,"Linked to MODAFL maritime procurement."\n',
+            ),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/ALT.CSV": (
+                200,
+                '44510,9001,"aka","SAHARA THUNDER TRADING CO.",-0- \n',
+            ),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/ADD.CSV": (
+                200,
+                '44510,8001,"Valiasr Ave","Tehran","Iran",-0- \n',
+            ),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/SDN_COMMENTS.CSV": (200, ""),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/CONS_PRIM.CSV": (
+                200,
+                '9640,"TEST CONSOLIDATED ENTITY",-0- ,"FSE-IR",-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,"Non-SDN designation."\n',
+            ),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/CONS_ALT.CSV": (200, ""),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/CONS_ADD.CSV": (200, ""),
+            "https://sanctionslistservice.ofac.treas.gov/api/download/CONS_COMMENTS.CSV": (200, ""),
+        }
+
+        def fake_fetcher(url: str) -> tuple[int, str]:
+            if "/changes/history/" in url:
+                return 200, '[{"publicationID": 1112, "datePublished": "2026-11-20T15:32:24"}]'
+            return mock_responses.get(url, (404, ""))
+
+        res = sync_ofac_lists(self.repo, force=True, fetcher=fake_fetcher)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["synced_count"], 2)
+        self.assertEqual(res["summary"]["sdn_count"], 1)
+        self.assertEqual(res["summary"]["consolidated_count"], 1)
+
+        # Verify subsequent check detects up-to-date publicationID without redownloading
+        check = sync_ofac_lists(self.repo, check_only=True, fetcher=fake_fetcher)
+        self.assertFalse(check["update_available"])
+
+        # Verify single FTS5 search matches BOTH OFAC_SANCTION (by name or alias) AND WikIran articles
+        search_engine = ArchiveSearchEngine(self.conn)
+        hits = search_engine.search(SearchFilters(query="Sahara Thunder"))
+        types_found = {h["record_type"] for h in hits}
+        self.assertIn("OFAC_SANCTION", types_found)
+        self.assertIn("ARTICLE", types_found)
+        ofac_hit = next(h for h in hits if h["record_type"] == "OFAC_SANCTION")
+        self.assertEqual(ofac_hit["ofac_ent_num"], 44510)
+        self.assertEqual(ofac_hit["ofac_programs"], "SDGT; IFSR")
+        self.assertIn("Tehran, Iran", ofac_hit["ofac_addresses"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

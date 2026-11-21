@@ -31,6 +31,12 @@ import {
   Wifi,
   WifiOff,
   Square,
+  Download,
+  Calendar,
+  Activity,
+  HardDrive,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -239,6 +245,40 @@ interface OverviewPayload {
     exports_dir: string;
     logs_dir: string;
   };
+  storage_volume?: {
+    db_bytes: number;
+    backups_bytes: number;
+    exports_bytes: number;
+    logs_bytes: number;
+    text_bytes: number;
+    total_bytes: number;
+    db_size_label: string;
+    total_size_label: string;
+    text_size_label: string;
+    total_records: number;
+    articles_count: number;
+    publications_count: number;
+    csv_rows_count: number;
+    ofac_entities_count?: number;
+    fts_indexed_count: number;
+  };
+  ofac_summary?: {
+    total_entities: number;
+    sdn_count: number;
+    consolidated_count: number;
+    iran_related_count: number;
+    individuals_count: number;
+    organizations_count: number;
+    vessels_count: number;
+    aircraft_count: number;
+    last_publication_id: string;
+    last_date_published: string;
+    last_synced_at: string;
+    sanctions_lists: string[];
+    sanctions_programs_count: number;
+    top_programs: Array<{ program: string; count: number }>;
+    sample_iran_entities: Array<Record<string, unknown>>;
+  };
 }
 
 export default function App() {
@@ -300,12 +340,39 @@ export default function App() {
   const [csvCrossDatasetAudit, setCsvCrossDatasetAudit] = useState<boolean>(false);
   const [activeCsvView, setActiveCsvView] = useState<ActiveCsvPayload | null>(null);
 
-  // Export Report Wizard state: allows clerk to choose specific data entities (Articles, Publications, Organizations, Tags)
+  // Export Report Wizard state: allows user to choose specific data entities (OFAC + WikIran) & optional date range
   const [wizardEntities, setWizardEntities] = useState<
-    Array<'articles' | 'publications' | 'organizations' | 'tags'>
-  >(['articles', 'publications']);
+    Array<'ofac_iran' | 'ofac_all' | 'articles' | 'publications' | 'organizations' | 'tags'>
+  >(['ofac_iran', 'articles', 'publications']);
+  const [wizardDateFrom, setWizardDateFrom] = useState<string>('');
+  const [wizardDateTo, setWizardDateTo] = useState<string>('');
 
-  const toggleWizardEntity = (entity: 'articles' | 'publications' | 'organizations' | 'tags') => {
+  // Collapsible optional archive reference tables drawer in sidebar (separated from core daily tools)
+  const [showArchiveTablesNav, setShowArchiveTablesNav] = useState<boolean>(false);
+
+  // Stylish Human-Readable Converter viewer tab ('ofac_iran' live preview vs uploaded 'csv' tables)
+  const [converterTab, setConverterTab] = useState<'ofac_iran' | 'csv'>('ofac_iran');
+  const [ofacViewerQuery, setOfacViewerQuery] = useState<string>('');
+
+  // Live Crawl / Spider Activity Monitor state
+  const [crawlElapsedSec, setCrawlElapsedSec] = useState<number>(0);
+  const [crawlModeLabel, setCrawlModeLabel] = useState<string>('');
+  const [liveCrawlStatus, setLiveCrawlStatus] = useState<{
+    active_job: CollectionJob | null;
+    recent_history: CollectionHistoryItem[];
+    articles_count: number;
+    publications_count: number;
+    stop_requested: boolean;
+    storage_volume?: OverviewPayload['storage_volume'];
+  } | null>(null);
+
+  // Quick source-scope tab inside Universal Search results (All vs OFAC Sanctions vs WikIran Archive)
+  const [searchScopeTab, setSearchScopeTab] = useState<'ALL' | 'OFAC' | 'WIKIRAN'>('ALL');
+  const [ofacStatusNote, setOfacStatusNote] = useState<string | null>(null);
+
+  const toggleWizardEntity = (
+    entity: 'ofac_iran' | 'ofac_all' | 'articles' | 'publications' | 'organizations' | 'tags'
+  ) => {
     setWizardEntities((prev) =>
       prev.includes(entity) ? prev.filter((item) => item !== entity) : [...prev, entity]
     );
@@ -420,6 +487,46 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Real-time live polling & elapsed timer while Lookup Server / Deep Spider crawling is active
+  const isCrawlingNow = busyAction === 'update' || busyAction === 'pipeline';
+
+  useEffect(() => {
+    if (!isCrawlingNow) return;
+    setCrawlElapsedSec(0);
+    let cancelled = false;
+
+    const tickTimer = window.setInterval(() => {
+      setCrawlElapsedSec((s) => s + 1);
+    }, 1000);
+
+    const pollStatus = async () => {
+      try {
+        const res = await fetch('/api/crawl-status');
+        const json = await res.json();
+        if (!cancelled && json.ok) {
+          setLiveCrawlStatus({
+            active_job: json.active_job || null,
+            recent_history: json.recent_history || [],
+            articles_count: json.articles_count ?? 0,
+            publications_count: json.publications_count ?? 0,
+            stop_requested: Boolean(json.stop_requested),
+          });
+        }
+      } catch {
+        // ignore transient poll errors while SQLite writes
+      }
+    };
+
+    pollStatus();
+    const pollTimer = window.setInterval(pollStatus, 1300);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(tickTimer);
+      window.clearInterval(pollTimer);
+    };
+  }, [isCrawlingNow]);
 
   const loadDoc = useCallback(async (key: string) => {
     setDocKey(key);
@@ -537,6 +644,9 @@ export default function App() {
 
   // Interactive Step-by-Step Pipeline Runner on the Dashboard
   const handleRunVisualPipeline = async () => {
+    setCrawlModeLabel(
+      lang === 'fa' ? 'اجرای ۴ مرحله‌ای زنده (Live Pipeline)' : '4-Step Live Pipeline'
+    );
     setBusyAction('pipeline');
     try {
       setActivePipelineStep(1);
@@ -670,6 +780,12 @@ export default function App() {
         ];
         const filtered = localPool.filter((item) => {
           if (targetType !== 'ALL' && item.record_type !== targetType) return false;
+          if (targetFrom || targetTo) {
+            const pubD = String(item.publication_date || '').trim().slice(0, 10);
+            if (!pubD) return false;
+            if (targetFrom && pubD < targetFrom) return false;
+            if (targetTo && pubD > targetTo) return false;
+          }
           if (!needle) return true;
           const haystack = `${item.title} ${item.short_description} ${item.matched_excerpt} ${item.organizations} ${item.source_url}`.toLowerCase();
           return haystack.includes(needle);
@@ -683,7 +799,69 @@ export default function App() {
 
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    setSearchScopeTab('ALL');
     await runUniversalSearchWithQuery(searchQuery);
+  };
+
+  const handleOfacSync = async (opts: { force?: boolean; check_only?: boolean } = {}) => {
+    if (isOffline) {
+      setBannerMessage({
+        text:
+          lang === 'fa'
+            ? 'آفلاین: اتصال به اینترنت برای همگام‌سازی اوفک (OFAC) برقرار نیست، اما جستجوی آفلاین در کل رکوردهای اوفک ذخیره‌شده کاملاً فعال است.'
+            : 'Offline Mode: Internet is needed to check U.S. Treasury SLS for updates, but offline screening across all locally saved OFAC sanctions records remains 100% active.',
+        type: 'error',
+      });
+      return;
+    }
+    setBusyAction(opts.check_only ? 'ofac_check' : 'ofac_sync');
+    setOfacStatusNote(null);
+    try {
+      const res = await fetch('/api/ofac/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      });
+      const json = await res.json();
+      if (json.ok) {
+        if (json.action === 'CHECK_ONLY') {
+          const msg = json.update_available
+            ? lang === 'fa'
+              ? `نسخه جدید اوفک (OFAC Publication #${json.latest_publication_id}) آماده دانلود است! برای دریافت کل دیتاست روی دکمه همگام‌سازی کلیک کنید.`
+              : `New OFAC update available! U.S. Treasury Publication #${json.latest_publication_id} (${String(json.latest_date_published || '').slice(0, 10)}) is ready to download.`
+            : lang === 'fa'
+            ? `دیتاست آفلاین اوفک شما کاملاً به‌روز است (Publication #${json.latest_publication_id} · ${Number(json.local_entities_count || 0).toLocaleString()} رکورد).`
+            : `Your offline OFAC dataset is up to date (U.S. Treasury Publication #${json.latest_publication_id} · ${Number(json.local_entities_count || 0).toLocaleString()} entities).`;
+          setOfacStatusNote(msg);
+          setBannerMessage({ text: msg, type: 'info' });
+        } else if (json.action === 'UP_TO_DATE') {
+          const msg =
+            lang === 'fa'
+              ? `دیتاست اوفک پیش‌تر با آخرین نسخه (#${json.latest_publication_id}) همگام‌سازی شده است.`
+              : `OFAC dataset already matches the latest U.S. Treasury Publication #${json.latest_publication_id}.`;
+          setOfacStatusNote(msg);
+          setBannerMessage({ text: msg, type: 'info' });
+        } else {
+          const count = Number(json.synced_count || json.summary?.total_entities || 0);
+          const msg =
+            lang === 'fa'
+              ? `همگام‌سازی کامل اوفک (OFAC) انجام شد: ${count.toLocaleString()} نهاد و فرد تحریمی (SDN + Non-SDN Consolidated · نسخه #${json.publication_id}) در دیتابیس محلی SQLite و جستجوی FTS5 ذخیره شدند.`
+              : `OFAC Super-Dataset synced: ${count.toLocaleString()} official SDN & Non-SDN Consolidated entities (Publication #${json.publication_id}) downloaded and indexed offline in SQLite FTS5.`;
+          setOfacStatusNote(msg);
+          setBannerMessage({ text: msg, type: 'info' });
+          await fetchOverview();
+        }
+      } else {
+        setBannerMessage({
+          text: json.error || 'OFAC sync failed. Please check network connectivity to sanctionslistservice.ofac.treas.gov.',
+          type: 'error',
+        });
+      }
+    } catch (err) {
+      setBannerMessage({ text: `OFAC sync error: ${String(err)}`, type: 'error' });
+    } finally {
+      setBusyAction(null);
+    }
   };
 
   const handleUpdateArchive = async (
@@ -701,6 +879,15 @@ export default function App() {
       });
       return;
     }
+    setCrawlModeLabel(
+      maxItems === 0
+        ? lang === 'fa'
+          ? 'خزش عنکبوتی کامل (تمام صفحات تا صفحه آخر)'
+          : 'Deep Spider Crawl (All Pages to End)'
+        : lang === 'fa'
+        ? 'بررسی و دریافت بروزرسانی‌های سرور (Lookup Server)'
+        : 'Server Lookup & Incremental Spider'
+    );
     setBusyAction('update');
     setBannerMessage(null);
     try {
@@ -953,8 +1140,11 @@ export default function App() {
     }
   };
 
-  // Distinct Role-Based Color-Coded Navigation Groups (Clerk vs Admin)
-  const clerkNavItems: Array<{
+  // Streamlined 3-Group Sidebar Navigation:
+  // 1) Core Daily Workspace (Dashboard, Search & Screen, Export & Converter)
+  // 2) Optional Archive Reference Tables (Articles, Catalogue, Organizations, Categories — collapsed by default)
+  // 3) System & Updates (History, Settings, Help)
+  const coreNavItems: Array<{
     id: NavSection;
     label: string;
     icon: React.ReactNode;
@@ -970,18 +1160,27 @@ export default function App() {
     },
     {
       id: 'search',
-      label: t.nav_search,
+      label: lang === 'fa' ? 'جستجو و استعلام (OFAC + ویکی‌ایران)' : 'Search & Screen',
       icon: <Search className="w-4 h-4 text-indigo-400 shrink-0" />,
       activeClass: 'bg-indigo-600 text-white shadow-xs',
       dotClass: 'bg-indigo-400',
     },
     {
       id: 'exports',
-      label: t.nav_exports,
+      label: lang === 'fa' ? 'خروجی اکسل و مبدل خوانا' : 'Export & Data Converter',
       icon: <FileSpreadsheet className="w-4 h-4 text-emerald-400 shrink-0" />,
       activeClass: 'bg-emerald-600 text-white shadow-xs',
       dotClass: 'bg-emerald-400',
     },
+  ];
+
+  const referenceTableNavItems: Array<{
+    id: NavSection;
+    label: string;
+    icon: React.ReactNode;
+    activeClass: string;
+    dotClass: string;
+  }> = [
     {
       id: 'articles',
       label: t.nav_articles,
@@ -1010,13 +1209,6 @@ export default function App() {
       activeClass: 'bg-purple-600 text-white shadow-xs',
       dotClass: 'bg-purple-400',
     },
-    {
-      id: 'help',
-      label: t.nav_help,
-      icon: <HelpCircle className="w-4 h-4 text-rose-400 shrink-0" />,
-      activeClass: 'bg-rose-600 text-white shadow-xs',
-      dotClass: 'bg-rose-400',
-    },
   ];
 
   const adminNavItems: Array<{
@@ -1037,12 +1229,19 @@ export default function App() {
       id: 'settings',
       label: t.nav_settings,
       icon: <Settings className="w-4 h-4 text-cyan-400 shrink-0" />,
-      activeClass: 'bg-cyan-600 text-white shadow-xs',
+      activeClass: 'bg-cyan-700 text-white shadow-xs',
       dotClass: 'bg-cyan-400',
+    },
+    {
+      id: 'help',
+      label: t.nav_help,
+      icon: <HelpCircle className="w-4 h-4 text-rose-400 shrink-0" />,
+      activeClass: 'bg-rose-600 text-white shadow-xs',
+      dotClass: 'bg-rose-400',
     },
   ];
 
-  const allNavItems = [...clerkNavItems, ...adminNavItems];
+  const allNavItems = [...coreNavItems, ...referenceTableNavItems, ...adminNavItems];
 
   if (loading || !data) {
     return (
@@ -1062,7 +1261,7 @@ export default function App() {
 
   const isFullUnredactedMode = data.settings?.strict_sensitive_exclusion === 'false';
 
-  const displayedSearchResults =
+  const displayedSearchResults = (
     searchResults !== null
       ? searchResults
       : [
@@ -1092,7 +1291,15 @@ export default function App() {
             extraction_status: p.extraction_status,
             record_version: p.record_version,
           })),
-        ];
+        ]
+  ).filter((row) => {
+    if (!filterDateFrom && !filterDateTo) return true;
+    const pubD = String(row.publication_date || '').trim().slice(0, 10);
+    if (!pubD) return false;
+    if (filterDateFrom && pubD < filterDateFrom) return false;
+    if (filterDateTo && pubD > filterDateTo) return false;
+    return true;
+  });
 
   const currentCsvState = activeCsvView ?? data.active_csv;
   const currentCsvDataset = currentCsvState?.dataset ?? null;
@@ -1281,13 +1488,13 @@ export default function App() {
           </button>
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-5 overflow-y-auto">
-          {/* Group 1: Clerk Tasks (Emerald / Indigo / Blue Color-Coded Group) */}
+        <nav className="flex-1 px-3 py-4 space-y-4 overflow-y-auto">
+          {/* Group 1: Core Daily Workspace (Dashboard, Search & Screen, Export & Converter) */}
           <div className="space-y-1">
             <div className="px-3 pb-1.5 text-[11px] font-bold uppercase tracking-wider text-emerald-400 flex items-center justify-between">
-              <span>{t.sidebarClerkGroup}</span>
+              <span>{lang === 'fa' ? 'میز کار روزانه (اصلی)' : 'Core Workspace'}</span>
             </div>
-            {clerkNavItems.map((item) => {
+            {coreNavItems.map((item) => {
               const active = activeNav === item.id;
               return (
                 <button
@@ -1296,10 +1503,10 @@ export default function App() {
                     setActiveNav(item.id);
                     setSidebarOpen(false);
                   }}
-                  className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-xs sm:text-sm font-medium rounded-md transition-colors cursor-pointer ${
+                  className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 text-xs sm:text-sm font-semibold rounded-md transition-colors cursor-pointer ${
                     active
                       ? item.activeClass
-                      : 'text-slate-300 hover:bg-slate-800/90 hover:text-white'
+                      : 'text-slate-200 hover:bg-slate-800/90 hover:text-white'
                   }`}
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
@@ -1316,7 +1523,57 @@ export default function App() {
             })}
           </div>
 
-          {/* Group 2: Admin Tasks (Amber / Cyan Color-Coded Group) */}
+          {/* Group 2: Separated Collapsible Reference Tables (Articles, Catalogue, Organizations, Categories) */}
+          <div className="space-y-1 pt-2 border-t border-slate-800">
+            <button
+              type="button"
+              onClick={() => setShowArchiveTablesNav((prev) => !prev)}
+              className="w-full px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400 hover:text-slate-200 flex items-center justify-between gap-2 rounded transition-colors cursor-pointer"
+            >
+              <span>
+                {lang === 'fa' ? 'جداول مرجع آرشیو (اختیاری)' : 'Archive Tables (Optional)'}
+              </span>
+              {showArchiveTablesNav ? (
+                <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 shrink-0" />
+              )}
+            </button>
+            {(showArchiveTablesNav ||
+              referenceTableNavItems.some((it) => it.id === activeNav)) && (
+              <div className="space-y-1 pt-0.5">
+                {referenceTableNavItems.map((item) => {
+                  const active = activeNav === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => {
+                        setActiveNav(item.id);
+                        setSidebarOpen(false);
+                      }}
+                      className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                        active
+                          ? item.activeClass
+                          : 'text-slate-400 hover:bg-slate-800/90 hover:text-white'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        {item.icon}
+                        <span className="truncate">{item.label}</span>
+                      </div>
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          active ? 'bg-white' : item.dotClass
+                        }`}
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Group 3: System, Sync & Settings */}
           <div className="space-y-1 pt-2 border-t border-slate-800">
             <div className="px-3 pb-1.5 text-[11px] font-bold uppercase tracking-wider text-amber-400 flex items-center justify-between">
               <span>{t.sidebarAdminGroup}</span>
@@ -1330,7 +1587,7 @@ export default function App() {
                     setActiveNav(item.id);
                     setSidebarOpen(false);
                   }}
-                  className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-xs sm:text-sm font-medium rounded-md transition-colors cursor-pointer ${
+                  className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
                     active
                       ? item.activeClass
                       : 'text-slate-300 hover:bg-slate-800/90 hover:text-white'
@@ -1351,8 +1608,95 @@ export default function App() {
           </div>
         </nav>
 
-        {/* Sidebar Footer: Language & Mode Switch */}
-        <div className="p-4 border-t border-slate-800 space-y-3 bg-slate-950/40">
+        {/* Sidebar Footer: Archive Size & Volume + How to Work + Language Switch */}
+        <div className="p-3.5 border-t border-slate-800 space-y-2.5 bg-slate-950/50">
+          {(() => {
+            const sv = liveCrawlStatus?.storage_volume || data.storage_volume;
+            const totalRecords =
+              sv?.total_records ??
+              data.stats.articles_count +
+                data.stats.publications_count +
+                data.stats.organizations_count +
+                data.stats.entities_count;
+            const dbSizeLabel = sv?.db_size_label || '—';
+            const totalSizeLabel = sv?.total_size_label || dbSizeLabel;
+            const artCount = sv?.articles_count ?? data.stats.articles_count;
+            const pubCount = sv?.publications_count ?? data.stats.publications_count;
+            const ofacCount = sv?.ofac_entities_count ?? data.ofac_summary?.total_entities ?? 0;
+            const csvCount = sv?.csv_rows_count ?? 0;
+            const dbSharePct =
+              sv && sv.total_bytes > 0
+                ? Math.min(100, Math.max(8, Math.round((sv.db_bytes / sv.total_bytes) * 100)))
+                : 100;
+
+            return (
+              <div className="bg-slate-900/95 border border-slate-700/80 rounded-lg p-3 space-y-2 shadow-inner">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-sky-400">
+                    <HardDrive className="w-3.5 h-3.5 shrink-0" />
+                    <span>{lang === 'fa' ? 'حجم و اندازه داده‌ها' : 'Data Size & Volume'}</span>
+                  </div>
+                  {(isCrawlingNow || busyAction === 'ofac_sync') && (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-300">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      LIVE
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-md px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400 leading-tight">
+                      {lang === 'fa' ? 'حجم دیتابیس' : 'SQLite DB'}
+                    </div>
+                    <div className="text-sm font-bold font-mono-tabular text-white mt-0.5">
+                      {dbSizeLabel}
+                    </div>
+                  </div>
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-md px-2.5 py-1.5">
+                    <div className="text-[10px] text-slate-400 leading-tight">
+                      {lang === 'fa' ? 'تعداد رکوردها' : 'Total Volume'}
+                    </div>
+                    <div className="text-sm font-bold font-mono-tabular text-emerald-300 mt-0.5">
+                      {totalRecords.toLocaleString()}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] text-slate-400">
+                    <span>{lang === 'fa' ? 'کل فضای دیسک آرشیو' : 'Total Disk Footprint'}</span>
+                    <span className="font-mono-tabular font-semibold text-slate-200">
+                      {totalSizeLabel}
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-sky-500 to-emerald-400 rounded-full transition-all duration-300"
+                      style={{ width: `${dbSharePct}%` }}
+                    />
+                  </div>
+                  <div className="text-[10px] font-mono-tabular text-slate-400 flex flex-wrap items-center justify-between gap-1 pt-0.5">
+                    <span>
+                      {lang === 'fa'
+                        ? `${artCount} مقاله · ${pubCount} فهرست`
+                        : `${artCount} Art · ${pubCount} Cat`}
+                    </span>
+                    {ofacCount > 0 ? (
+                      <span className="text-rose-300 font-semibold">
+                        {ofacCount.toLocaleString()} OFAC
+                      </span>
+                    ) : csvCount > 0 ? (
+                      <span className="text-sky-300/90">
+                        {lang === 'fa' ? `${csvCount} ردیف CSV` : `${csvCount} CSV`}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           <button
             onClick={() => {
               setShowWorkflowModal(true);
@@ -1608,94 +1952,240 @@ export default function App() {
                   </div>
                 </div>
 
-                {pipelineLog && (
+                {pipelineLog && !isCrawlingNow && (
                   <div className="px-5 sm:px-6 py-3 bg-sky-50 border-b border-sky-200 text-xs font-semibold text-sky-950 flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                      <RefreshCw
-                        className={`w-4 h-4 text-sky-700 shrink-0 ${
-                          busyAction === 'pipeline' || busyAction === 'update' ? 'animate-spin' : ''
-                        }`}
-                      />
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                       <span>{pipelineLog}</span>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
-                      {(busyAction === 'pipeline' || busyAction === 'update') && (
-                        <button
-                          type="button"
-                          onClick={handleStopCrawl}
-                          className="px-2.5 py-1 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded inline-flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Square className="w-3 h-3 fill-current" />
-                          <span>{lang === 'fa' ? 'توقف عملیات (Stop)' : 'Stop'}</span>
-                        </button>
-                      )}
                       <span className="font-mono-tabular text-sky-800">
                         Step {activePipelineStep}/4
                       </span>
+                      <button
+                        type="button"
+                        onClick={() => setPipelineLog(null)}
+                        className="text-slate-500 hover:text-slate-800 cursor-pointer"
+                        aria-label="Dismiss status"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
                     </div>
+                  </div>
+                )}
+
+                {/* LIVE CRAWLING & SERVER LOOKUP ACTIVITY MONITOR */}
+                {isCrawlingNow && (
+                  <div className="bg-slate-950 text-slate-100 border-b border-sky-500/40 px-5 sm:px-6 py-4 space-y-3.5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <span className="relative flex h-3 w-3 shrink-0">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500" />
+                        </span>
+                        <Activity className="w-4 h-4 text-sky-400 shrink-0" />
+                        <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                          {lang === 'fa' ? 'در حال خزش زنده' : 'LIVE SPIDER ACTIVE'}
+                        </span>
+                        <span className="text-xs text-slate-300 truncate">
+                          · {crawlModeLabel || (lang === 'fa' ? 'بررسی سرور wikiran.org' : 'Crawling wikiran.org')}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-3 shrink-0">
+                        <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono-tabular text-xs text-sky-300">
+                          {String(Math.floor(crawlElapsedSec / 60)).padStart(2, '0')}:
+                          {String(crawlElapsedSec % 60).padStart(2, '0')}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleStopCrawl}
+                          className="px-3 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-md inline-flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                        >
+                          <Square className="w-3 h-3 fill-current" />
+                          <span>{lang === 'fa' ? 'توقف فوری (Stop)' : 'Stop Crawl'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Live Progress Bar & Metrics */}
+                    {(() => {
+                      const job = liveCrawlStatus?.active_job;
+                      const isRunningJob = job && job.status === 'RUNNING';
+                      const discovered = isRunningJob ? job.total_discovered : 0;
+                      const processed = isRunningJob ? job.processed_count : 0;
+                      const newRecs = isRunningJob ? job.new_records_count : 0;
+                      const pct =
+                        discovered > 0
+                          ? Math.min(100, Math.round((processed / discovered) * 100))
+                          : 0;
+
+                      return (
+                        <div className="space-y-2.5">
+                          <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                            {discovered > 0 ? (
+                              <div
+                                className="h-full bg-gradient-to-r from-sky-500 via-cyan-400 to-emerald-400 transition-all duration-500"
+                                style={{ width: `${Math.max(8, pct)}%` }}
+                              />
+                            ) : (
+                              <div className="h-full w-2/5 bg-gradient-to-r from-sky-500 via-cyan-400 to-emerald-400 animate-pulse rounded-full" />
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
+                              <span className="text-slate-400">
+                                {lang === 'fa' ? 'لینک کشف‌شده' : 'Discovered'}
+                              </span>
+                              <span className="font-mono-tabular font-bold text-sky-300">
+                                {discovered > 0 ? discovered : 'Scanning…'}
+                              </span>
+                            </div>
+                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
+                              <span className="text-slate-400">
+                                {lang === 'fa' ? 'صفحه بررسی‌شده' : 'Processed'}
+                              </span>
+                              <span className="font-mono-tabular font-bold text-cyan-300">
+                                {processed}
+                                {discovered > 0 ? ` / ${discovered}` : ''}
+                              </span>
+                            </div>
+                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
+                              <span className="text-slate-400">
+                                {lang === 'fa' ? 'رکورد جدید' : 'New Saved'}
+                              </span>
+                              <span className="font-mono-tabular font-bold text-emerald-400">
+                                +{newRecs}
+                              </span>
+                            </div>
+                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
+                              <span className="text-slate-400">
+                                {lang === 'fa' ? 'کل آرشیو' : 'Archive Total'}
+                              </span>
+                              <span className="font-mono-tabular font-bold text-amber-300">
+                                {(liveCrawlStatus?.articles_count ?? data.stats.articles_count) +
+                                  (liveCrawlStatus?.publications_count ??
+                                    data.stats.publications_count)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Live URL Stream from SQLite collection_history */}
+                          <div className="bg-slate-900/80 border border-slate-800 rounded-md px-3 py-2 space-y-1 max-h-28 overflow-y-auto font-mono-tabular text-[11px]">
+                            <div className="text-sky-400 flex items-center gap-1.5">
+                              <RefreshCw className="w-3 h-3 animate-spin shrink-0" />
+                              <span className="truncate">
+                                {pipelineLog ||
+                                  (lang === 'fa'
+                                    ? 'در حال بررسی robots.txt، صفحات مقالات و لینک‌های داخلی wikiran.org...'
+                                    : 'Inspecting robots.txt, paginated feeds (/search?tabType=articles), /leaks & internal links...')}
+                              </span>
+                            </div>
+                            {(liveCrawlStatus?.recent_history || []).slice(0, 4).map((item) => (
+                              <div
+                                key={item.id}
+                                className="flex items-center justify-between gap-2 text-slate-300 border-t border-slate-800/70 pt-1"
+                              >
+                                <span className="truncate">
+                                  <span
+                                    className={`font-bold me-1.5 ${
+                                      item.action_taken === 'INSERTED'
+                                        ? 'text-emerald-400'
+                                        : item.action_taken === 'UPDATED'
+                                        ? 'text-sky-400'
+                                        : 'text-slate-400'
+                                    }`}
+                                  >
+                                    [{item.action_taken}]
+                                  </span>
+                                  {item.target_url.replace('https://wikiran.org', '')}
+                                </span>
+                                <span className="text-slate-500 shrink-0">{item.record_type}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
 
                 {/* 4 Color-Distinguished Operational Steps */}
                 <div className="p-4 sm:p-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  {/* Step 1: Sky Blue — Lookup Server Updates (Deep Spider Crawler) */}
+                  {/* Step 1: Sky Blue — Lookup Server Updates (Polished Deep Spider Control Card) */}
                   <div
-                    className={`rounded-lg p-4 border border-t-4 border-t-sky-600 transition-colors flex flex-col justify-between space-y-4 ${
-                      activePipelineStep === 1
-                        ? 'bg-sky-100/80 border-sky-500'
-                        : 'bg-sky-50/60 border-sky-200'
+                    className={`rounded-xl p-4 border-2 border-t-4 border-t-sky-600 transition-all flex flex-col justify-between space-y-4 shadow-xs ${
+                      isCrawlingNow
+                        ? 'bg-sky-50 border-sky-400 ring-2 ring-sky-200/70'
+                        : activePipelineStep === 1
+                        ? 'bg-sky-100/70 border-sky-400'
+                        : 'bg-gradient-to-b from-sky-50/90 to-white border-sky-200'
                     }`}
                   >
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between text-sky-900">
-                        <span className="text-sm font-bold">{t.step1Title}</span>
-                        <Globe className="w-4 h-4 text-sky-700 shrink-0" />
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between gap-2 text-sky-950">
+                        <span className="text-sm font-bold leading-snug">{t.step1Title}</span>
+                        {isCrawlingNow ? (
+                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-ping" />
+                            {lang === 'fa' ? 'زنده' : 'LIVE'}
+                          </span>
+                        ) : (
+                          <span className="p-1.5 rounded-lg bg-sky-100 text-sky-700 shrink-0">
+                            <Globe className="w-4 h-4" />
+                          </span>
+                        )}
                       </div>
-                      <p className="text-xs text-slate-700 leading-relaxed">{t.step1Desc}</p>
+                      <p className="text-xs text-slate-600 leading-relaxed">{t.step1Desc}</p>
                     </div>
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-1.5">
+
+                    {/* Polished 3-Button Spider Control Tray */}
+                    <div className="bg-white border border-sky-200/90 rounded-lg p-2 space-y-2 shadow-2xs">
+                      <div className="grid grid-cols-12 gap-1.5">
                         <button
+                          type="button"
                           onClick={() => handleUpdateArchive(undefined, 12, true)}
-                          disabled={busyAction === 'update' || busyAction === 'pipeline'}
-                          className="flex-1 py-2 px-2.5 text-xs font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                          disabled={isCrawlingNow}
+                          className="col-span-8 py-2 px-2.5 text-xs font-bold text-white bg-sky-700 hover:bg-sky-800 active:bg-sky-900 rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-55 shadow-2xs"
                         >
                           <RefreshCw
-                            className={`w-3.5 h-3.5 ${
-                              busyAction === 'update' ? 'animate-spin' : ''
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              isCrawlingNow ? 'animate-spin' : ''
                             }`}
                           />
-                          <span>{t.step1Action}</span>
+                          <span className="truncate">{t.step1Action}</span>
                         </button>
                         <button
                           type="button"
                           onClick={handleStopCrawl}
+                          disabled={!isCrawlingNow}
                           title={
                             lang === 'fa'
                               ? 'توقف خزش و ذخیره نقطه بازیابی (Stop)'
                               : 'Stop spider crawling & save checkpoint'
                           }
-                          className={`py-2 px-2.5 text-xs font-bold rounded-md transition-colors inline-flex items-center justify-center gap-1 cursor-pointer shrink-0 ${
-                            busyAction === 'update' || busyAction === 'pipeline'
-                              ? 'bg-red-600 text-white hover:bg-red-700 shadow-xs'
-                              : 'bg-red-100 text-red-800 border border-red-300 hover:bg-red-200'
+                          className={`col-span-4 py-2 px-2 text-xs font-bold rounded-md transition-all inline-flex items-center justify-center gap-1 ${
+                            isCrawlingNow
+                              ? 'bg-red-600 text-white hover:bg-red-700 cursor-pointer shadow-xs ring-2 ring-red-200'
+                              : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
                           }`}
                         >
-                          <Square className="w-3 h-3 fill-current" />
+                          <Square className="w-3 h-3 fill-current shrink-0" />
                           <span>{lang === 'fa' ? 'توقف' : 'Stop'}</span>
                         </button>
                       </div>
                       <button
                         type="button"
                         onClick={() => handleUpdateArchive(undefined, 0, true)}
-                        disabled={busyAction === 'update' || busyAction === 'pipeline'}
-                        className="w-full py-1.5 px-2.5 text-[11px] font-bold text-sky-950 bg-white hover:bg-sky-100 border border-sky-300 rounded-md transition-colors inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-50"
+                        disabled={isCrawlingNow}
+                        className="w-full py-2 px-2.5 text-[11px] font-bold text-indigo-900 bg-indigo-50/80 hover:bg-indigo-100 border border-indigo-200 rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
                       >
-                        <Globe className="w-3 h-3 text-sky-700" />
-                        <span>
+                        <Activity className="w-3.5 h-3.5 text-indigo-700 shrink-0" />
+                        <span className="truncate">
                           {lang === 'fa'
                             ? 'خزش عنکبوتی کامل (تمام صفحات تا صفحه آخر)'
-                            : 'Deep Spider Crawl (All Pages & Links to End)'}
+                            : 'Deep Spider Crawl (All Pages & Links)'}
                         </span>
                       </button>
                     </div>
@@ -1775,6 +2265,179 @@ export default function App() {
                 </div>
               </section>
 
+              {/* U.S. TREASURY OFAC SANCTIONS SUPER-DATASET (OFFLINE TRADE SCREENING + AUTO-UPDATE) */}
+              {(() => {
+                const ofac = data.ofac_summary;
+                const totalOfac = ofac?.total_entities ?? 0;
+                const sdnCount = ofac?.sdn_count ?? 0;
+                const consCount = ofac?.consolidated_count ?? 0;
+                const iranCount = ofac?.iran_related_count ?? 0;
+                const pubId = ofac?.last_publication_id || '—';
+                const pubDate = (ofac?.last_date_published || '').slice(0, 10) || '—';
+
+                return (
+                  <section className="bg-white border-2 border-rose-200 rounded-xl p-4 sm:p-6 shadow-2xs space-y-4">
+                    <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-rose-100 pb-4">
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-rose-600 text-white rounded">
+                            OFAC SLS API
+                          </span>
+                          <h2 className="text-base font-bold text-slate-900">
+                            {lang === 'fa'
+                              ? 'سوپردیتاست آفلاین تحریم‌های اوفک (OFAC SDN + Consolidated) برای استعلام تجاری'
+                              : 'U.S. Treasury OFAC Sanctions Super-Dataset (Offline Trade Screening)'}
+                          </h2>
+                        </div>
+                        <p className="text-xs text-slate-600 leading-relaxed max-w-3xl">
+                          {lang === 'fa'
+                            ? 'متصل به سرویس رسمی وزارت خزانه‌داری آمریکا (sanctionslistservice.ofac.treas.gov). تمامی لیست‌های SDN و Non-SDN Consolidated به‌همراه اسامی مستعار (AKA)، آدرس‌ها و برنامه‌های تحریمی به‌صورت آفلاین در SQLite FTS5 ذخیره شده و همزمان با آرشیو ویکی‌ایران جستجو می‌شوند.'
+                            : 'Connected directly to official U.S. Treasury Sanctions List Service (sanctionslistservice.ofac.treas.gov). Downloads and indexes 100% of SDN & Non-SDN Consolidated entities, aliases (AKAs), addresses, vessels, and remarks into local SQLite FTS5 for instant offline trade counterparty screening alongside WikIran.'}
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          disabled={busyAction !== null}
+                          onClick={() => handleOfacSync({ check_only: true })}
+                          className="px-3.5 py-2 text-xs font-bold text-rose-900 bg-rose-50 hover:bg-rose-100 border border-rose-300 rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${busyAction === 'ofac_check' ? 'animate-spin' : ''}`}
+                          />
+                          <span>
+                            {busyAction === 'ofac_check'
+                              ? lang === 'fa'
+                                ? 'در حال بررسی...'
+                                : 'Checking OFAC...'
+                              : lang === 'fa'
+                              ? 'بررسی آپدیت جدید اوفک'
+                              : 'Check OFAC Updates'}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={busyAction !== null}
+                          onClick={() => handleOfacSync({ force: true })}
+                          className="px-4 py-2 text-xs font-bold text-white bg-rose-700 hover:bg-rose-800 rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-60"
+                        >
+                          <HardDriveDownload
+                            className={`w-3.5 h-3.5 ${busyAction === 'ofac_sync' ? 'animate-pulse' : ''}`}
+                          />
+                          <span>
+                            {busyAction === 'ofac_sync'
+                              ? lang === 'fa'
+                                ? 'در حال دانلود کل لیست‌های اوفک...'
+                                : 'Downloading Full OFAC Lists...'
+                              : lang === 'fa'
+                              ? 'دانلود و همگام‌سازی کامل اوفک'
+                              : 'Sync Full OFAC Dataset'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {ofacStatusNote && (
+                      <div className="px-3.5 py-2.5 rounded-lg bg-rose-50/80 border border-rose-200 text-xs font-medium text-rose-950">
+                        {ofacStatusNote}
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'کل رکوردهای آفلاین اوفک' : 'Total Offline OFAC'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-rose-700 mt-1">
+                          {totalOfac.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5 font-mono-tabular">
+                          {lang === 'fa' ? `نسخه رسمی #${pubId}` : `Treasury Pub #${pubId}`}
+                        </div>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'لیست اصلی SDN' : 'SDN List Entries'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-slate-900 mt-1">
+                          {sdnCount.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          SDN + ALT + ADD + COMMENTS
+                        </div>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'لیست تجمیعی Non-SDN' : 'Non-SDN Consolidated'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-slate-900 mt-1">
+                          {consCount.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          FSE · SSI · CAPTA · CMIC
+                        </div>
+                      </div>
+
+                      <div className="bg-rose-50/70 border border-rose-200 rounded-lg p-3">
+                        <div className="text-[11px] text-rose-800 font-semibold">
+                          {lang === 'fa' ? 'مرتبط با ایران (IRAN/IRGC)' : 'Iran-Linked Designations'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-rose-800 mt-1">
+                          {iranCount.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-rose-700 mt-0.5">
+                          IRAN · IRGC · IFSR · EO13902
+                        </div>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'آخرین تاریخ انتشار خزانه‌داری' : 'Last Treasury Publish'}
+                        </div>
+                        <div className="text-base font-bold font-mono-tabular text-slate-900 mt-1">
+                          {pubDate}
+                        </div>
+                        <div className="text-[10px] text-emerald-700 font-semibold mt-0.5">
+                          {lang === 'fa'
+                            ? 'بررسی خودکار در زمان‌بندی فعال است'
+                            : 'Auto-checked in Scheduler'}
+                        </div>
+                      </div>
+                    </div>
+
+                    {ofac && ofac.top_programs && ofac.top_programs.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        <span className="text-[11px] font-bold text-slate-600 me-1">
+                          {lang === 'fa'
+                            ? 'برنامه‌های تحریمی برتر (کلیک برای استعلام):'
+                            : 'Top Sanctions Programs (click to screen):'}
+                        </span>
+                        {ofac.top_programs.slice(0, 8).map((p) => (
+                          <button
+                            key={p.program}
+                            type="button"
+                            onClick={() => {
+                              setActiveNav('search');
+                              setSearchQuery(p.program);
+                              setFilterType('OFAC_SANCTION');
+                              setSearchScopeTab('ALL');
+                              runUniversalSearchWithQuery(p.program, { type: 'OFAC_SANCTION' });
+                            }}
+                            className="px-2 py-0.5 text-[11px] font-mono-tabular font-semibold bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 rounded cursor-pointer transition-colors"
+                          >
+                            {p.program} ({p.count.toLocaleString()})
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                );
+              })()}
+
               {/* QUICK ACTIONS */}
               <section className="space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1792,26 +2455,30 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-                  {/* Task 1: Universal Search */}
+                  {/* Core Action 1: Search & Screen Counterparties (OFAC + WikIran) */}
                   <button
                     onClick={() => setActiveNav('search')}
                     className="flex flex-col justify-between p-4 bg-white border border-indigo-200 border-t-4 border-t-indigo-600 rounded-lg hover:bg-indigo-50/50 transition-colors text-start cursor-pointer space-y-3 shadow-2xs"
                   >
                     <div className="flex items-center justify-between w-full">
                       <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-indigo-100 text-indigo-900">
-                        SQLite FTS5
+                        OFAC + WikIran
                       </span>
                       <Search className="w-4 h-4 text-indigo-700 shrink-0" />
                     </div>
                     <div>
-                      <div className="text-sm font-bold text-slate-900">{t.actionSearch}</div>
+                      <div className="text-sm font-bold text-slate-900">
+                        {lang === 'fa' ? 'جستجو و استعلام تجاری' : 'Search & Screen Names'}
+                      </div>
                       <div className="text-xs text-slate-600 mt-0.5">
-                        Articles + Emails + Files + CSV Rows
+                        {lang === 'fa'
+                          ? 'بررسی آفلاین ۲۰٬۰۸۵ رکورد اوفک + کل ویکی‌ایران'
+                          : 'Offline check across 20,085 OFAC + WikIran'}
                       </div>
                     </div>
                   </button>
 
-                  {/* Task 2: CSV-to-Excel Workbench */}
+                  {/* Core Action 2: Export Excel & Human-Readable Converter */}
                   <button
                     onClick={() => setActiveNav('exports')}
                     className="flex flex-col justify-between p-4 bg-white border border-emerald-200 border-t-4 border-t-emerald-600 rounded-lg hover:bg-emerald-50/50 transition-colors text-start cursor-pointer space-y-3 shadow-2xs"
@@ -1820,85 +2487,51 @@ export default function App() {
                       <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-100 text-emerald-900">
                         Excel (.xlsx)
                       </span>
-                      <Table className="w-4 h-4 text-emerald-700 shrink-0" />
-                    </div>
-                    <div>
-                      <div className="text-sm font-bold text-slate-900">{t.actionCsvWorkbench}</div>
-                      <div className="text-xs text-slate-600 mt-0.5">
-                        Preview All Matching Records (.xlsx)
-                      </div>
-                    </div>
-                  </button>
-
-                  {/* Task 3: Browse Articles */}
-                  <button
-                    onClick={() => setActiveNav('articles')}
-                    className="flex flex-col justify-between p-4 bg-white border border-blue-200 border-t-4 border-t-blue-600 rounded-lg hover:bg-blue-50/50 transition-colors text-start cursor-pointer space-y-3 shadow-2xs"
-                  >
-                    <div className="flex items-center justify-between w-full">
-                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-blue-100 text-blue-900">
-                        Articles
-                      </span>
-                      <BookOpen className="w-4 h-4 text-blue-700 shrink-0" />
+                      <FileSpreadsheet className="w-4 h-4 text-emerald-700 shrink-0" />
                     </div>
                     <div>
                       <div className="text-sm font-bold text-slate-900">
-                        {t.actionBrowseArticles}
+                        {lang === 'fa' ? 'خروجی اکسل و مبدل خوانا' : 'Export & Data Converter'}
                       </div>
                       <div className="text-xs text-slate-600 mt-0.5">
-                        {data.stats.articles_count} Verified Editorial Reports
+                        {lang === 'fa'
+                          ? 'ساخت گزارش اوفک/ویکی‌ایران و تبدیل خوانای CSV'
+                          : 'OFAC & WikIran Excel reports + Human CSV viewer'}
                       </div>
                     </div>
                   </button>
 
-                  {/* Task 4: Browse Catalogue */}
+                  {/* Core Action 3: Sync OFAC Sanctions */}
                   <button
-                    onClick={() => setActiveNav('publications')}
-                    className="flex flex-col justify-between p-4 bg-white border border-teal-200 border-t-4 border-t-teal-600 rounded-lg hover:bg-teal-50/50 transition-colors text-start cursor-pointer space-y-3 shadow-2xs"
+                    onClick={() => handleOfacSync({ force: false })}
+                    disabled={busyAction !== null}
+                    className="flex flex-col justify-between p-4 bg-white border border-rose-200 border-t-4 border-t-rose-600 rounded-lg hover:bg-rose-50/50 transition-colors text-start disabled:opacity-50 cursor-pointer space-y-3 shadow-2xs"
                   >
                     <div className="flex items-center justify-between w-full">
-                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-teal-100 text-teal-900">
-                        Catalogues
-                      </span>
-                      <FolderKanban className="w-4 h-4 text-teal-700 shrink-0" />
-                    </div>
-                    <div>
-                      <div className="text-sm font-bold text-slate-900">
-                        {t.actionBrowseCatalogue}
-                      </div>
-                      <div className="text-xs text-slate-600 mt-0.5">
-                        {data.stats.publications_count} Publication Catalogues
-                      </div>
-                    </div>
-                  </button>
-
-                  {/* Task 5: Deep Spider Update Archive */}
-                  <button
-                    onClick={() => handleUpdateArchive(undefined, 12, true)}
-                    disabled={busyAction === 'update'}
-                    className="flex flex-col justify-between p-4 bg-white border border-amber-300 border-t-4 border-t-amber-600 rounded-lg hover:bg-amber-50/50 transition-colors text-start disabled:opacity-50 cursor-pointer space-y-3 shadow-2xs"
-                  >
-                    <div className="flex items-center justify-between w-full">
-                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-amber-100 text-amber-950">
-                        Deep Spider
+                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-rose-100 text-rose-900">
+                        U.S. Treasury
                       </span>
                       <RefreshCw
-                        className={`w-4 h-4 text-amber-700 shrink-0 ${
-                          busyAction === 'update' ? 'animate-spin' : ''
+                        className={`w-4 h-4 text-rose-700 shrink-0 ${
+                          busyAction === 'ofac_sync' || busyAction === 'ofac_check'
+                            ? 'animate-spin'
+                            : ''
                         }`}
                       />
                     </div>
                     <div>
                       <div className="text-sm font-bold text-slate-900">
-                        {t.actionUpdateArchive}
+                        {lang === 'fa' ? 'به‌روزرسانی لیست‌های اوفک' : 'Check & Sync OFAC'}
                       </div>
                       <div className="text-xs text-slate-600 mt-0.5">
-                        Multi-Page Spider Discovery & Sync
+                        {lang === 'fa'
+                          ? 'بررسی آخرین نسخه SDN و Consolidated خزانه‌داری'
+                          : 'Check latest SDN & Consolidated delta updates'}
                       </div>
                     </div>
                   </button>
 
-                  {/* Admin Task 2: Create SQLite Backup */}
+                  {/* Core Action 4: Create SQLite Backup */}
                   <button
                     onClick={handleCreateBackup}
                     disabled={busyAction === 'backup'}
@@ -2146,11 +2779,11 @@ export default function App() {
                       : 'Try searching across all downloaded data:'}
                   </span>
                   {[
+                    { label: 'Sahara Thunder (OFAC + WikIran)', query: 'Sahara Thunder' },
+                    { label: 'Bank Melli (OFAC + WikIran)', query: 'Bank Melli' },
+                    { label: 'IRISL (Shipping Sanctions)', query: 'IRISL' },
+                    { label: 'Mahan Air (OFAC)', query: 'Mahan Air' },
                     { label: 'settlements@rahbar (Email)', query: 'settlements@rahbar' },
-                    { label: 'AE070331234567890123456 (IBAN)', query: 'AE070331234567890123456' },
-                    { label: '/document/emails/ (Emails)', query: '/document/emails/' },
-                    { label: 'SWIFT MT103 (Banking File)', query: 'SWIFT MT103' },
-                    { label: 'Sahara Thunder', query: 'Sahara Thunder' },
                     { label: 'MODAFL', query: 'MODAFL' },
                   ].map((chip) => (
                     <button
@@ -2159,6 +2792,7 @@ export default function App() {
                       onClick={() => {
                         setSearchQuery(chip.query);
                         setFilterType('ALL');
+                        setSearchScopeTab('ALL');
                         runUniversalSearchWithQuery(chip.query, { type: 'ALL' });
                       }}
                       className="px-2.5 py-1 text-xs font-mono-tabular bg-indigo-50 text-indigo-800 border border-indigo-200 rounded hover:bg-indigo-100 transition-colors cursor-pointer"
@@ -2168,10 +2802,14 @@ export default function App() {
                   ))}
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
                   <select
                     value={filterCategory}
-                    onChange={(e) => setFilterCategory(e.target.value)}
+                    onChange={(e) => {
+                      const nextVal = e.target.value;
+                      setFilterCategory(nextVal);
+                      runUniversalSearchWithQuery(searchQuery, { category: nextVal });
+                    }}
                     className="px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
                   >
                     <option value="ALL">{t.filterCategory}</option>
@@ -2184,7 +2822,11 @@ export default function App() {
 
                   <select
                     value={filterOrg}
-                    onChange={(e) => setFilterOrg(e.target.value)}
+                    onChange={(e) => {
+                      const nextVal = e.target.value;
+                      setFilterOrg(nextVal);
+                      runUniversalSearchWithQuery(searchQuery, { org: nextVal });
+                    }}
                     className="px-3 py-2 text-xs border border-slate-300 rounded-md bg-white"
                   >
                     <option value="ALL">{t.filterOrganization}</option>
@@ -2197,10 +2839,18 @@ export default function App() {
 
                   <select
                     value={filterType}
-                    onChange={(e) => setFilterType(e.target.value)}
+                    onChange={(e) => {
+                      const nextVal = e.target.value;
+                      setFilterType(nextVal);
+                      setSearchScopeTab('ALL');
+                      runUniversalSearchWithQuery(searchQuery, { type: nextVal });
+                    }}
                     className="px-3 py-2 text-xs border border-slate-300 rounded-md bg-white font-semibold text-indigo-950"
                   >
                     <option value="ALL">{t.filterSourceType}</option>
+                    <option value="OFAC_SANCTION">
+                      OFAC Sanctions Lists (SDN + Non-SDN Consolidated)
+                    </option>
                     <option value="ARTICLE">Articles (/document/articles/*)</option>
                     <option value="PUBLICATION">Publication Catalogues (/leak/*)</option>
                     <option value="CSV_ROW">
@@ -2209,124 +2859,518 @@ export default function App() {
                     <option value="FILE_INVENTORY">File & Document Inventory</option>
                     <option value="ENTITY">Organizations & Entities</option>
                   </select>
-
-                  <input
-                    type="date"
-                    value={filterDateFrom}
-                    onChange={(e) => setFilterDateFrom(e.target.value)}
-                    aria-label={t.filterDateFrom}
-                    className="px-3 py-2 text-xs border border-slate-300 rounded-md bg-white font-mono-tabular"
-                  />
-
-                  <input
-                    type="date"
-                    value={filterDateTo}
-                    onChange={(e) => setFilterDateTo(e.target.value)}
-                    aria-label={t.filterDateTo}
-                    className="px-3 py-2 text-xs border border-slate-300 rounded-md bg-white font-mono-tabular"
-                  />
                 </div>
+
+                {/* Publication Date Range Filter (Matching Export Report Wizard) */}
+                {(() => {
+                  const matchedArticlesCount = displayedSearchResults.filter(
+                    (r) => r.record_type === 'ARTICLE'
+                  ).length;
+                  const matchedPubsCount = displayedSearchResults.filter(
+                    (r) => r.record_type === 'PUBLICATION'
+                  ).length;
+                  return (
+                    <div className="bg-slate-50/80 border border-slate-200 rounded-lg p-3.5 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
+                          <Calendar className="w-4 h-4 text-indigo-600 shrink-0" />
+                          <span>
+                            {lang === 'fa'
+                              ? 'فیلتر بازه زمانی تاریخ انتشار (مقالات و انتشارات):'
+                              : 'Publication Date Range Filter (Articles & Publications):'}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFilterDateFrom('2026-01-01');
+                              setFilterDateTo('2026-12-31');
+                              runUniversalSearchWithQuery(searchQuery, {
+                                from: '2026-01-01',
+                                to: '2026-12-31',
+                              });
+                            }}
+                            className={`px-2.5 py-1 text-[11px] font-semibold border rounded cursor-pointer transition-colors ${
+                              filterDateFrom === '2026-01-01' && filterDateTo === '2026-12-31'
+                                ? 'bg-indigo-600 text-white border-indigo-600'
+                                : 'bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-800 border-slate-300'
+                            }`}
+                          >
+                            2026
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFilterDateFrom('2025-01-01');
+                              setFilterDateTo('2026-12-31');
+                              runUniversalSearchWithQuery(searchQuery, {
+                                from: '2025-01-01',
+                                to: '2026-12-31',
+                              });
+                            }}
+                            className={`px-2.5 py-1 text-[11px] font-semibold border rounded cursor-pointer transition-colors ${
+                              filterDateFrom === '2025-01-01' && filterDateTo === '2026-12-31'
+                                ? 'bg-indigo-600 text-white border-indigo-600'
+                                : 'bg-white hover:bg-indigo-50 text-slate-700 hover:text-indigo-800 border-slate-300'
+                            }`}
+                          >
+                            2025–2026
+                          </button>
+                          {(filterDateFrom || filterDateTo) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFilterDateFrom('');
+                                setFilterDateTo('');
+                                runUniversalSearchWithQuery(searchQuery, {
+                                  from: '',
+                                  to: '',
+                                });
+                              }}
+                              className="px-2.5 py-1 text-[11px] font-semibold bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded cursor-pointer transition-colors"
+                            >
+                              {lang === 'fa' ? 'پاک کردن بازه' : 'Clear Dates'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                        <div className="space-y-1">
+                          <label className="block text-[11px] font-semibold text-slate-600">
+                            {lang === 'fa' ? 'از تاریخ (Start Date):' : 'Start Date (From):'}
+                          </label>
+                          <input
+                            type="date"
+                            value={filterDateFrom}
+                            onChange={(e) => {
+                              const nextFrom = e.target.value;
+                              setFilterDateFrom(nextFrom);
+                              runUniversalSearchWithQuery(searchQuery, { from: nextFrom });
+                            }}
+                            aria-label={t.filterDateFrom}
+                            className="w-full px-3 py-2 text-xs font-mono-tabular border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="block text-[11px] font-semibold text-slate-600">
+                            {lang === 'fa' ? 'تا تاریخ (End Date):' : 'End Date (To):'}
+                          </label>
+                          <input
+                            type="date"
+                            value={filterDateTo}
+                            onChange={(e) => {
+                              const nextTo = e.target.value;
+                              setFilterDateTo(nextTo);
+                              runUniversalSearchWithQuery(searchQuery, { to: nextTo });
+                            }}
+                            aria-label={t.filterDateTo}
+                            className="w-full px-3 py-2 text-xs font-mono-tabular border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                          />
+                        </div>
+                        <div className="px-3 py-2 rounded-md bg-indigo-50/80 border border-indigo-200 text-xs text-indigo-950 font-medium">
+                          {filterDateFrom || filterDateTo ? (
+                            <span>
+                              {lang === 'fa'
+                                ? `مطابق بازه زمانی: ${matchedArticlesCount} مقاله · ${matchedPubsCount} انتشار`
+                                : `Matching Date Range: ${matchedArticlesCount} Articles · ${matchedPubsCount} Publications`}
+                            </span>
+                          ) : (
+                            <span className="text-slate-600">
+                              {lang === 'fa'
+                                ? 'همه تاریخ‌های انتشار شامل می‌شوند (بدون محدودیت زمانی)'
+                                : 'All publication dates included (no date restriction)'}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
               </form>
 
-              <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-                <div className="px-4 sm:px-6 py-3 bg-indigo-50/70 border-b border-indigo-100 flex flex-wrap items-center justify-between gap-2 text-xs text-indigo-950 font-medium">
-                  <span>
-                    {lang === 'fa'
-                      ? `تعداد نتایج یافت‌شده در کل داده‌های دانلودشده: ${displayedSearchResults.length}`
-                      : `Showing ${displayedSearchResults.length} matching records across all downloaded archive tables`}
-                  </span>
-                  <span className="font-mono-tabular">
-                    fts_archive JOIN (articles, publications, csv_row_content, file_metadata)
-                  </span>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm text-start border-collapse">
-                    <thead>
-                      <tr className="border-b border-slate-200 bg-slate-50/60 text-xs text-slate-500">
-                        <th className="py-3 px-4 sm:px-6 text-start font-medium">{t.colTitle}</th>
-                        <th className="py-3 px-4 text-start font-medium">{t.colDate}</th>
-                        <th className="py-3 px-4 text-start font-medium">{t.colCategory}</th>
-                        <th className="py-3 px-4 sm:px-6 text-start font-medium">{t.colSource}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200">
-                      {displayedSearchResults.map((row, idx) => {
-                        const summaryText = String(row.short_description || '');
-                        const excerptText = String(
-                          (row as Record<string, unknown>).matched_excerpt || ''
-                        );
-                        const showDistinctExcerpt =
-                          Boolean(searchQuery.trim()) &&
-                          Boolean(excerptText) &&
-                          excerptText !== summaryText;
+              {(() => {
+                const ofacMatches = displayedSearchResults.filter(
+                  (r) => r.record_type === 'OFAC_SANCTION'
+                );
+                const wikiranMatches = displayedSearchResults.filter(
+                  (r) => r.record_type !== 'OFAC_SANCTION'
+                );
+                const scopedResults =
+                  searchScopeTab === 'OFAC'
+                    ? ofacMatches
+                    : searchScopeTab === 'WIKIRAN'
+                    ? wikiranMatches
+                    : displayedSearchResults;
 
-                        return (
-                          <tr
-                            key={`${row.record_type}-${row.id}-${idx}`}
-                            className="hover:bg-slate-50 transition-colors"
+                return (
+                  <div className="space-y-3">
+                    {/* Trade Counterparty OFAC + WikIran Screening Verdict Banner */}
+                    {Boolean(searchQuery.trim()) && searchResults !== null && (
+                      <div
+                        className={`rounded-lg border-2 p-3.5 flex flex-wrap items-center justify-between gap-3 ${
+                          ofacMatches.length > 0
+                            ? 'bg-rose-50 border-rose-300 text-rose-950'
+                            : 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          {ofacMatches.length > 0 ? (
+                            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+                          ) : (
+                            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                          )}
+                          <div className="space-y-0.5">
+                            <div className="text-xs sm:text-sm font-bold">
+                              {ofacMatches.length > 0
+                                ? lang === 'fa'
+                                  ? `هشدار تحریم تجاری: ${ofacMatches.length} تطابق در لیست‌های تحریمی اوفک (OFAC) یافت شد!`
+                                  : `SANCTIONS SCREENING ALERT: ${ofacMatches.length} U.S. Treasury OFAC Match(es) Found!`
+                                : lang === 'fa'
+                                ? `بدون تطابق در اوفک (0 مورد در ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} رکورد آفلاین OFAC)`
+                                : `OFAC Clear: 0 Sanctions Matches across ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} offline Treasury entities`}
+                            </div>
+                            <div className="text-[11px] opacity-85">
+                              {lang === 'fa'
+                                ? `آرشیو ویکی‌ایران: ${wikiranMatches.length} رکورد منطبق · نسخه اوفک #${data.ofac_summary?.last_publication_id || '—'}`
+                                : `WikIran Archive: ${wikiranMatches.length} matching records · Offline OFAC Treasury Pub #${data.ofac_summary?.last_publication_id || '—'}`}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setSearchScopeTab('ALL')}
+                            className={`px-2.5 py-1 text-xs font-bold rounded border cursor-pointer transition-colors ${
+                              searchScopeTab === 'ALL'
+                                ? 'bg-slate-900 text-white border-slate-900'
+                                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                            }`}
                           >
-                            <td className="py-3.5 px-4 sm:px-6 space-y-1.5">
-                              <div className="font-semibold text-slate-900">
-                                {highlightSearchTerms(String(row.title || ''), searchQuery)}
-                              </div>
-                              <div className="text-xs text-slate-700 leading-relaxed">
-                                {highlightSearchTerms(summaryText, searchQuery)}
-                              </div>
-                              {showDistinctExcerpt && (
-                                <div className="text-xs text-slate-800 bg-amber-50/80 border-s-2 border-amber-400 ps-2.5 py-1 rounded-e leading-relaxed">
-                                  <span className="font-semibold text-slate-600 me-1">
-                                    {lang === 'fa' ? 'گزیده متن منطبق:' : 'Matched Excerpt:'}
-                                  </span>
-                                  {highlightSearchTerms(excerptText.slice(0, 320), searchQuery)}
-                                </div>
-                              )}
-                              <div className="text-xs text-indigo-700 font-semibold">
-                                <span>{String(row.record_type || '')}</span>
-                                {row.organizations ? (
-                                  <>
-                                    <span aria-hidden="true"> · </span>
-                                    <span>
-                                      {highlightSearchTerms(
-                                        String(row.organizations),
-                                        searchQuery
+                            {lang === 'fa' ? 'همه' : 'All'} ({displayedSearchResults.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSearchScopeTab('OFAC')}
+                            className={`px-2.5 py-1 text-xs font-bold rounded border cursor-pointer transition-colors ${
+                              searchScopeTab === 'OFAC'
+                                ? 'bg-rose-700 text-white border-rose-700'
+                                : 'bg-white text-rose-800 border-rose-300 hover:bg-rose-50'
+                            }`}
+                          >
+                            OFAC ({ofacMatches.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSearchScopeTab('WIKIRAN')}
+                            className={`px-2.5 py-1 text-xs font-bold rounded border cursor-pointer transition-colors ${
+                              searchScopeTab === 'WIKIRAN'
+                                ? 'bg-indigo-700 text-white border-indigo-700'
+                                : 'bg-white text-indigo-800 border-indigo-300 hover:bg-indigo-50'
+                            }`}
+                          >
+                            WikIran ({wikiranMatches.length})
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                      <div className="px-4 sm:px-6 py-3 bg-indigo-50/70 border-b border-indigo-100 flex flex-wrap items-center justify-between gap-3 text-xs text-indigo-950 font-medium">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <span>
+                            {lang === 'fa'
+                              ? `تعداد نتایج نمایش‌داده‌شده (ویکی‌ایران + اوفک): ${scopedResults.length}`
+                              : `Showing ${scopedResults.length} matching records across WikIran + OFAC offline tables`}
+                          </span>
+                          {(filterDateFrom || filterDateTo) && (
+                            <span className="px-2 py-0.5 text-[11px] font-mono-tabular font-semibold bg-amber-50 text-amber-800 border border-amber-300 rounded">
+                              {filterDateFrom || '…'} → {filterDateTo || '…'}
+                            </span>
+                          )}
+                          <span className="hidden md:inline font-mono-tabular text-[11px] text-indigo-700/80">
+                            fts_archive JOIN (ofac_entities, articles, publications, csv_row_content, file_metadata)
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={scopedResults.length === 0}
+                          onClick={() => {
+                            const csvEscape = (v: unknown) =>
+                              `"${String(v ?? '').replace(/"/g, '""')}"`;
+                            const headers = [
+                              'Record_Type',
+                              'ID',
+                              'Title',
+                              'Publication_Date',
+                              'Category',
+                              'Organizations_or_Countries',
+                              'OFAC_List',
+                              'OFAC_Programs',
+                              'OFAC_Aliases',
+                              'Summary',
+                              'Matched_Excerpt',
+                              'Source_URL',
+                            ];
+                            const rows = scopedResults.map((row) => [
+                              row.record_type || '',
+                              (row as Record<string, unknown>).ofac_ent_num || row.id || '',
+                              row.title || '',
+                              row.publication_date || '',
+                              (isRtl ? row.category_fa : row.category_en) || '',
+                              row.organizations || '',
+                              (row as Record<string, unknown>).ofac_list_source || '',
+                              String((row as Record<string, unknown>).ofac_programs || '').replace(/\]\s*\[/g, '; '),
+                              (row as Record<string, unknown>).ofac_aliases || '',
+                              row.short_description || '',
+                              (row as Record<string, unknown>).matched_excerpt ||
+                                (row as Record<string, unknown>).editorial_content ||
+                                '',
+                              row.source_url || '',
+                            ]);
+                            const csvContent =
+                              '\uFEFF' +
+                              [headers.join(','), ...rows.map((r) => r.map(csvEscape).join(','))].join(
+                                '\r\n'
+                              );
+                            const blob = new Blob([csvContent], {
+                              type: 'text/csv;charset=utf-8',
+                            });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            const dateStamp = new Date().toISOString().slice(0, 10);
+                            const qSlug = searchQuery
+                              .trim()
+                              .toLowerCase()
+                              .replace(/[^a-z0-9]+/g, '_')
+                              .replace(/^_|_$/g, '')
+                              .slice(0, 24);
+                            const dateRangeSlug =
+                              filterDateFrom || filterDateTo
+                                ? `_${filterDateFrom || 'start'}_to_${filterDateTo || 'latest'}`
+                                : '';
+                            a.href = url;
+                            a.download = `wikiran_ofac_screening${qSlug ? `_${qSlug}` : ''}${dateRangeSlug}_${dateStamp}.csv`;
+                            document.body.appendChild(a);
+                            a.click();
+                            setTimeout(() => {
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }, 250);
+                            setBannerMessage({
+                              text:
+                                lang === 'fa'
+                                  ? `خروجی سریع CSV برای ${scopedResults.length} نتیجه استعلام (ویکی‌ایران + اوفک) دانلود شد.`
+                                  : `Quick Export complete: Downloaded ${scopedResults.length} filtered screening results (WikIran + OFAC) as CSV.`,
+                              type: 'info',
+                            });
+                          }}
+                          className="px-3.5 py-1.5 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer shadow-2xs shrink-0"
+                        >
+                          <Download className="w-3.5 h-3.5 shrink-0" />
+                          <span>
+                            {lang === 'fa'
+                              ? `خروجی سریع CSV (${scopedResults.length} نتیجه)`
+                              : `Quick Export CSV (${scopedResults.length})`}
+                          </span>
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-start border-collapse">
+                          <thead>
+                            <tr className="border-b border-slate-200 bg-slate-50/60 text-xs text-slate-500">
+                              <th className="py-3 px-4 sm:px-6 text-start font-medium">{t.colTitle}</th>
+                              <th className="py-3 px-4 text-start font-medium">{t.colDate}</th>
+                              <th className="py-3 px-4 text-start font-medium">{t.colCategory}</th>
+                              <th className="py-3 px-4 sm:px-6 text-start font-medium">{t.colSource}</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200">
+                            {scopedResults.map((row, idx) => {
+                              const isOfac = row.record_type === 'OFAC_SANCTION';
+                              const ofacList = String((row as Record<string, unknown>).ofac_list_source || 'SDN');
+                              const ofacType = String((row as Record<string, unknown>).ofac_sdn_type || '');
+                              const ofacEntNum = (row as Record<string, unknown>).ofac_ent_num;
+                              const ofacProgramsClean = String(
+                                (row as Record<string, unknown>).ofac_programs || ''
+                              )
+                                .replace(/\]\s*\[/g, '; ')
+                                .replace(/^\[|\]$/g, '');
+                              const ofacAliases = String(
+                                (row as Record<string, unknown>).ofac_aliases || ''
+                              );
+                              const ofacAddresses = String(
+                                (row as Record<string, unknown>).ofac_addresses || ''
+                              );
+
+                              const summaryText = String(row.short_description || '');
+                              const excerptText = String(
+                                (row as Record<string, unknown>).matched_excerpt ||
+                                  (row as Record<string, unknown>).editorial_content ||
+                                  ''
+                              );
+                              const showDistinctExcerpt =
+                                !isOfac &&
+                                Boolean(searchQuery.trim()) &&
+                                Boolean(excerptText) &&
+                                excerptText !== summaryText;
+
+                              return (
+                                <tr
+                                  key={`${row.record_type}-${row.id}-${idx}`}
+                                  className={
+                                    isOfac
+                                      ? 'bg-rose-50/35 hover:bg-rose-50/70 transition-colors'
+                                      : 'hover:bg-slate-50 transition-colors'
+                                  }
+                                >
+                                  <td className="py-3.5 px-4 sm:px-6 space-y-1.5">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      {isOfac && (
+                                        <span
+                                          className={`px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded ${
+                                            ofacList === 'SDN'
+                                              ? 'bg-rose-700 text-white'
+                                              : 'bg-amber-700 text-white'
+                                          }`}
+                                        >
+                                          OFAC {ofacList}
+                                        </span>
                                       )}
-                                    </span>
-                                  </>
-                                ) : null}
-                              </div>
-                            </td>
-                            <td className="py-3.5 px-4 font-mono-tabular text-xs text-slate-700 whitespace-nowrap">
-                              {String(row.publication_date || '')}
-                            </td>
-                            <td className="py-3.5 px-4 text-xs text-slate-700">
-                              {highlightSearchTerms(
-                                String(isRtl ? row.category_fa : row.category_en),
-                                searchQuery
-                              )}
-                            </td>
-                            <td className="py-3.5 px-4 sm:px-6 text-xs">
-                              <a
-                                href={String(row.source_url || '#')}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-indigo-700 hover:text-indigo-950 underline inline-flex items-center gap-1 font-mono-tabular break-all"
-                              >
-                                <span>
-                                  {highlightSearchTerms(
-                                    String(row.source_url || '').replace('https://wikiran.org', ''),
-                                    searchQuery
-                                  )}
-                                </span>
-                                <ExternalLink className="w-3 h-3 shrink-0" />
-                              </a>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+                                      {isOfac && ofacType && (
+                                        <span className="px-1.5 py-0.5 text-[10px] font-semibold uppercase bg-slate-200 text-slate-800 rounded">
+                                          {ofacType}
+                                        </span>
+                                      )}
+                                      {isOfac && ofacEntNum ? (
+                                        <span className="text-[11px] font-mono-tabular text-rose-800 font-semibold">
+                                          ID #{String(ofacEntNum)}
+                                        </span>
+                                      ) : null}
+                                      <span className="font-semibold text-slate-900">
+                                        {highlightSearchTerms(String(row.title || ''), searchQuery)}
+                                      </span>
+                                    </div>
+
+                                    {isOfac ? (
+                                      <div className="space-y-1 text-xs">
+                                        {ofacProgramsClean && (
+                                          <div className="flex flex-wrap items-center gap-1">
+                                            {ofacProgramsClean
+                                              .split(';')
+                                              .map((p) => p.trim())
+                                              .filter(Boolean)
+                                              .map((prog) => (
+                                                <span
+                                                  key={prog}
+                                                  className="px-1.5 py-0.5 text-[10px] font-mono-tabular font-bold bg-rose-100 text-rose-900 border border-rose-200 rounded"
+                                                >
+                                                  {highlightSearchTerms(prog, searchQuery)}
+                                                </span>
+                                              ))}
+                                          </div>
+                                        )}
+                                        {ofacAliases && (
+                                          <div className="text-slate-700 leading-relaxed">
+                                            <span className="font-semibold text-slate-900 me-1">
+                                              {lang === 'fa' ? 'اسامی مستعار (AKA):' : 'Aliases (AKA):'}
+                                            </span>
+                                            {highlightSearchTerms(ofacAliases.slice(0, 260), searchQuery)}
+                                          </div>
+                                        )}
+                                        {ofacAddresses && (
+                                          <div className="text-slate-600 leading-relaxed">
+                                            <span className="font-semibold text-slate-800 me-1">
+                                              {lang === 'fa' ? 'نشانی‌ها:' : 'Addresses:'}
+                                            </span>
+                                            {highlightSearchTerms(ofacAddresses.slice(0, 220), searchQuery)}
+                                          </div>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <div className="text-xs text-slate-700 leading-relaxed">
+                                          {highlightSearchTerms(summaryText, searchQuery)}
+                                        </div>
+                                        {showDistinctExcerpt && (
+                                          <div className="text-xs text-slate-800 bg-amber-50/80 border-s-2 border-amber-400 ps-2.5 py-1 rounded-e leading-relaxed">
+                                            <span className="font-semibold text-slate-600 me-1">
+                                              {lang === 'fa' ? 'گزیده متن منطبق:' : 'Matched Excerpt:'}
+                                            </span>
+                                            {highlightSearchTerms(excerptText.slice(0, 320), searchQuery)}
+                                          </div>
+                                        )}
+                                      </>
+                                    )}
+
+                                    <div
+                                      className={`text-xs font-semibold ${
+                                        isOfac ? 'text-rose-800' : 'text-indigo-700'
+                                      }`}
+                                    >
+                                      <span>{String(row.record_type || '')}</span>
+                                      {row.organizations ? (
+                                        <>
+                                          <span aria-hidden="true"> · </span>
+                                          <span>
+                                            {highlightSearchTerms(
+                                              String(row.organizations),
+                                              searchQuery
+                                            )}
+                                          </span>
+                                        </>
+                                      ) : null}
+                                    </div>
+                                  </td>
+                                  <td className="py-3.5 px-4 font-mono-tabular text-xs text-slate-700 whitespace-nowrap">
+                                    {String(row.publication_date || '')}
+                                  </td>
+                                  <td className="py-3.5 px-4 text-xs text-slate-700">
+                                    {highlightSearchTerms(
+                                      String(isRtl ? row.category_fa : row.category_en).replace(
+                                        /\]\s*\[/g,
+                                        '; '
+                                      ),
+                                      searchQuery
+                                    )}
+                                  </td>
+                                  <td className="py-3.5 px-4 sm:px-6 text-xs">
+                                    <a
+                                      href={String(row.source_url || '#')}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className={`${
+                                        isOfac
+                                          ? 'text-rose-800 hover:text-rose-950'
+                                          : 'text-indigo-700 hover:text-indigo-950'
+                                      } underline inline-flex items-center gap-1 font-mono-tabular break-all`}
+                                    >
+                                      <span>
+                                        {highlightSearchTerms(
+                                          String(row.source_url || '')
+                                            .replace('https://wikiran.org', '')
+                                            .replace(
+                                              'https://sanctionslistservice.ofac.treas.gov',
+                                              'OFAC SLS'
+                                            ),
+                                          searchQuery
+                                        )}
+                                      </span>
+                                      <ExternalLink className="w-3 h-3 shrink-0" />
+                                    </a>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -2557,266 +3601,86 @@ export default function App() {
             </div>
           )}
 
-          {/* 7. EXCEL & CSV WORKBENCH (With "Preview All Matching Records" & Cross-Dataset Audit) */}
+          {/* 7. EXPORT REPORTS & STYLISH HUMAN-READABLE DATA CONVERTER */}
           {activeNav === 'exports' && (
             <div className="space-y-8">
-              <section className="bg-white border-2 border-emerald-300 rounded-xl overflow-hidden shadow-xs">
-                <div className="bg-emerald-900 text-white px-5 sm:px-6 py-5 flex flex-wrap items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <div className="text-xs font-semibold text-emerald-300 tracking-wide">
-                      {lang === 'fa'
-                        ? 'مبدل هوشمند CSV به اکسل و پیش‌نمایش کامل رکوردها'
-                        : 'CSV-TO-EXCEL SPREADSHEET READER & FULL RECORD PREVIEW'}
-                    </div>
-                    <h2 className="text-lg font-bold text-white">{t.csvWorkbenchTitle}</h2>
-                    <p className="text-xs text-emerald-100 max-w-3xl">{t.csvWorkbenchSubtitle}</p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-                    <label className="px-4 py-2 text-xs font-semibold text-emerald-950 bg-emerald-300 hover:bg-emerald-200 rounded-lg transition-colors inline-flex items-center gap-2 cursor-pointer">
-                      <Upload className="w-4 h-4" />
-                      <span>{t.csvUploadBtn}</span>
-                      <input
-                        type="file"
-                        accept=".csv,text/csv"
-                        onChange={handleCsvFileUpload}
-                        className="hidden"
-                      />
-                    </label>
-                    {currentCsvDataset && currentCsvDataset.id > 0 && (
-                      <a
-                        href={`/api/csv/download/${currentCsvDataset.id}`}
-                        className="px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-400 rounded-lg transition-colors inline-flex items-center gap-2"
-                      >
-                        <FileSpreadsheet className="w-4 h-4" />
-                        <span>{t.csvDownloadXlsxBtn}</span>
-                      </a>
-                    )}
-                  </div>
-                </div>
-
-                {/* Dataset Selector, Instant Search & Admin "Preview All Matching Records" Controls */}
-                <div className="p-4 sm:p-5 bg-emerald-50/60 border-b border-emerald-200 space-y-4">
-                  <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-xs font-semibold text-emerald-950">
-                        {lang === 'fa' ? 'جدول فعال:' : 'Active CSV Table:'}
-                      </span>
-                      {(data.csv_datasets || []).map((ds) => (
-                        <button
-                          key={ds.id}
-                          onClick={() =>
-                            handleCsvFilterChange(ds.id, csvFilterQuery, csvPreviewAll, false)
-                          }
-                          className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-                            !csvCrossDatasetAudit && currentCsvDataset?.id === ds.id
-                              ? 'bg-emerald-700 text-white'
-                              : 'bg-white text-emerald-900 border border-emerald-300 hover:bg-emerald-100'
-                          }`}
-                        >
-                          {ds.dataset_name} ({ds.row_count})
-                        </button>
-                      ))}
-                      <button
-                        onClick={() =>
-                          handleCsvFilterChange(
-                            selectedCsvId,
-                            csvFilterQuery,
-                            true,
-                            !csvCrossDatasetAudit
-                          )
-                        }
-                        className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
-                          csvCrossDatasetAudit
-                            ? 'bg-indigo-700 text-white'
-                            : 'bg-white text-indigo-900 border border-indigo-300 hover:bg-indigo-50'
-                        }`}
-                      >
-                        <Layers className="w-3.5 h-3.5" />
-                        <span>{t.csvCrossDatasetBtn}</span>
-                      </button>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <div className="relative flex-1 min-w-[220px]">
-                        <input
-                          type="text"
-                          value={csvFilterQuery}
-                          onChange={(e) =>
-                            handleCsvFilterChange(
-                              currentCsvDataset?.id ?? selectedCsvId,
-                              e.target.value,
-                              csvPreviewAll,
-                              csvCrossDatasetAudit
-                            )
-                          }
-                          placeholder={t.csvSearchPlaceholder}
-                          className="w-full px-3 py-1.5 text-xs bg-white border border-emerald-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600"
-                        />
-                      </div>
-
-                      {/* Admin Audit Toggle: Preview All Matching Records vs Subset */}
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleCsvFilterChange(
-                            currentCsvDataset?.id ?? selectedCsvId,
-                            csvFilterQuery,
-                            !csvPreviewAll,
-                            csvCrossDatasetAudit
-                          )
-                        }
-                        className={`px-3.5 py-1.5 text-xs font-bold rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
-                          csvPreviewAll
-                            ? 'bg-amber-600 text-white hover:bg-amber-700'
-                            : 'bg-emerald-800 text-white hover:bg-emerald-900'
-                        }`}
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        <span>
-                          {csvPreviewAll ? t.csvPreviewSubsetBtn : t.csvPreviewAllBtn}
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Audit Status Strip showing Displayed vs Total Matching Records */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-white border border-emerald-200 rounded-md text-xs">
-                    <div className="font-semibold text-slate-800">
-                      {lang === 'fa' ? (
-                        <span>
-                          نمایش <span className="font-mono-tabular text-emerald-800">{displayedCsvCount}</span> رکورد از مجموع{' '}
-                          <span className="font-mono-tabular text-emerald-800">{totalCsvMatching}</span> رکورد منطبق
-                          {csvPreviewAll ? ' (حالت ممیزی کامل تمام رکوردها فعال است)' : ' (حالت پیش‌نمایش خلاصه)'}
-                        </span>
-                      ) : (
-                        <span>
-                          Showing <span className="font-mono-tabular text-emerald-800">{displayedCsvCount}</span> of{' '}
-                          <span className="font-mono-tabular text-emerald-800">{totalCsvMatching}</span> matching records
-                          {csvPreviewAll ? ' (Full Record Preview — All Matching Records)' : ' (Compact Subset Mode)'}
-                        </span>
-                      )}
-                    </div>
-
-                    {isCsvSubset && !csvPreviewAll && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleCsvFilterChange(
-                            currentCsvDataset?.id ?? selectedCsvId,
-                            csvFilterQuery,
-                            true,
-                            csvCrossDatasetAudit
-                          )
-                        }
-                        className="text-xs font-bold text-indigo-700 hover:text-indigo-950 underline inline-flex items-center gap-1 cursor-pointer"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        <span>
-                          {lang === 'fa'
-                            ? `مشاهده هر ${totalCsvMatching} رکورد منطبق ←`
-                            : `Preview all ${totalCsvMatching} matching records →`}
-                        </span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Excel-Style Grid Table */}
-                {currentCsvDataset ? (
-                  <div className={`overflow-x-auto ${csvPreviewAll ? 'max-h-[640px]' : 'max-h-96'}`}>
-                    <table className="w-full text-xs text-start border-collapse">
-                      <thead>
-                        <tr className="bg-slate-100 border-b border-slate-300 text-slate-700 sticky top-0">
-                          <th className="py-2.5 px-3 border-e border-slate-300 font-mono-tabular text-center w-12 bg-slate-200">
-                            #
-                          </th>
-                          {currentCsvDataset.headers.map((h) => (
-                            <th
-                              key={h}
-                              className="py-2.5 px-4 border-e border-slate-200 font-bold text-slate-800 whitespace-nowrap"
-                            >
-                              {h}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-200">
-                        {currentCsvRows.map((r) => (
-                          <tr
-                            key={`${r.id}-${r.row_number}`}
-                            className="hover:bg-emerald-50/60 transition-colors even:bg-slate-50/60"
-                          >
-                            <td className="py-2.5 px-3 border-e border-slate-200 font-mono-tabular text-center text-slate-500 bg-slate-100/70 font-semibold">
-                              {r.row_number}
-                            </td>
-                            {currentCsvDataset.headers.map((h) => (
-                              <td
-                                key={h}
-                                className={`py-2.5 px-4 border-e border-slate-100 text-slate-800 ${
-                                  csvPreviewAll ? 'min-w-[160px]' : 'max-w-xs truncate'
-                                }`}
-                                title={r.cells[h] || ''}
-                              >
-                                {r.cells[h] || ''}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : null}
-              </section>
-
-              {/* EXPORT REPORT WIZARD: Choose Specific Data Entities (Articles, Publications, Organizations, or Tags) */}
+              {/* SECTION 1 (TOP): EXPORT REPORT WIZARD (OFAC SANCTIONS + WIKIRAN EXCEL BUILDER) */}
               <section className="bg-white border-2 border-indigo-300 rounded-xl overflow-hidden shadow-xs">
                 <div className="bg-slate-900 text-white px-5 sm:px-6 py-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800">
                   <div className="space-y-1">
                     <div className="text-xs font-bold text-amber-400 uppercase tracking-wider">
                       {lang === 'fa'
-                        ? 'ویزارد ساخت گزارش سفارشی اکسل (.XLSX)'
-                        : 'EXPORT REPORT WIZARD · CUSTOM EXCEL (.XLSX) BUILDER'}
+                        ? 'گزارش‌ساز رسمی اکسل (.XLSX) — اوفک + ویکی‌ایران'
+                        : 'EXPORT REPORT WIZARD · OFAC + WIKIRAN EXCEL (.XLSX) BUILDER'}
                     </div>
-                    <h3 className="text-base sm:text-lg font-bold text-white">
+                    <h2 className="text-base sm:text-lg font-bold text-white">
                       {lang === 'fa'
-                        ? 'انتخاب بخش‌های دلخواه برای خروجی اکسل (مقالات، انتشارات، سازمان‌ها یا برچسب‌ها)'
-                        : 'Export Report Wizard — Choose Specific Data Entities to Include in Excel'}
-                    </h3>
+                        ? 'ساخت و دانلود گزارش اکسل سفارشی (تحریم‌های ایران اوفک، کل اوفک و آرشیو ویکی‌ایران)'
+                        : 'Export Styled Excel (.xlsx) Reports — Choose OFAC & WikIran Sheets'}
+                    </h2>
                     <p className="text-xs text-slate-300 max-w-3xl">
                       {lang === 'fa'
-                        ? 'به‌جای خروجی گرفتن از تمام جداول به صورت یکجا، دقیقاً مشخص کنید کدام بخش‌ها (Articles، Publications، Organizations یا Tags) در فایل اکسل (.xlsx) شما قرار بگیرند.'
-                        : 'Select exactly which data entities (Articles, Publications, Organizations, or Tags) you want to include as worksheets in your custom Excel (.xlsx) report instead of exporting everything at once.'}
+                        ? 'دقیقاً انتخاب کنید کدام شیت‌ها (لیست تحریم‌های ایران اوفک، کل دیتاست اوفک، مقالات یا انتشارات ویکی‌ایران) با بازه زمانی دلخواه در فایل اکسل قرار بگیرند.'
+                        : 'Select which formatted worksheets (OFAC Iran Sanctions, Full OFAC SDN + Consolidated, WikIran Articles, Publications, Organizations, or Tags) to include in one clean Excel (.xlsx) report.'}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <button
                       type="button"
-                      onClick={() =>
-                        setWizardEntities(['articles', 'publications', 'organizations', 'tags'])
-                      }
-                      className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
+                      onClick={() => setWizardEntities(['ofac_iran', 'articles', 'publications'])}
+                      className="px-3 py-1.5 text-xs font-semibold text-white bg-rose-700 hover:bg-rose-600 rounded-md transition-colors cursor-pointer"
                     >
-                      {lang === 'fa' ? 'انتخاب هر ۴ بخش' : 'Select All 4 Entities'}
+                      {lang === 'fa' ? 'پکیج تجاری (اوفک ایران + ویکی‌ایران)' : 'OFAC Iran + WikIran'}
                     </button>
                     <button
                       type="button"
-                      onClick={() => setWizardEntities(['articles'])}
+                      onClick={() => setWizardEntities(['ofac_iran'])}
                       className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
                     >
-                      {lang === 'fa' ? 'فقط مقالات' : 'Articles Only'}
+                      {lang === 'fa' ? 'فقط اوفک ایران' : 'OFAC Iran Only'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWizardEntities(['ofac_all'])}
+                      className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
+                    >
+                      {lang === 'fa' ? 'کل دیتاست اوفک' : 'Full OFAC (All)'}
                     </button>
                   </div>
                 </div>
 
                 <div className="p-5 sm:p-6 space-y-5 bg-slate-50/70">
-                  {/* Step 1: Select Entities Checkboxes */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {/* Step 1: Select Worksheets Checkboxes (OFAC + WikIran) */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
                     {[
                       {
+                        key: 'ofac_iran' as const,
+                        titleEn: 'OFAC Iran-Linked Sanctions',
+                        titleFa: 'تحریم‌های مرتبط با ایران اوفک (OFAC)',
+                        count: data.ofac_summary?.iran_related_count ?? 0,
+                        descEn:
+                          'All Iran-linked SDN & Consolidated entities (IRAN, IRGC, IFSR, EO13902, EO13846) with aliases & addresses',
+                        descFa:
+                          'همه نهادها و افراد تحریمی مرتبط با ایران در اوفک (IRAN, IRGC, IFSR, EO13902) همراه با AKA و نشانی',
+                        borderColor: 'border-rose-500 bg-rose-50/70',
+                        badgeColor: 'bg-rose-100 text-rose-900',
+                      },
+                      {
+                        key: 'ofac_all' as const,
+                        titleEn: 'OFAC Full Global Sanctions',
+                        titleFa: 'کل دیتاست جهانی اوفک (SDN + Consolidated)',
+                        count: data.ofac_summary?.total_entities ?? 0,
+                        descEn:
+                          'Complete U.S. Treasury SDN + Non-SDN Consolidated lists (all 8 lists, all active programs)',
+                        descFa:
+                          'تمامی ۸ لیست رسمی خزانه‌داری آمریکا (SDN + Non-SDN Consolidated) با تمام برنامه‌ها',
+                        borderColor: 'border-red-600 bg-red-50/60',
+                        badgeColor: 'bg-red-100 text-red-900',
+                      },
+                      {
                         key: 'articles' as const,
-                        titleEn: 'Articles',
-                        titleFa: 'مقالات تحلیلی (Articles)',
+                        titleEn: 'WikIran Articles',
+                        titleFa: 'مقالات تحلیلی ویکی‌ایران (Articles)',
                         count: data.stats.articles_count,
                         descEn: 'Titles, dates, authors, categories, summaries & source URLs',
                         descFa: 'عنوان، تاریخ انتشار، نویسنده، دسته‌بندی، خلاصه و لینک منبع',
@@ -2825,8 +3689,8 @@ export default function App() {
                       },
                       {
                         key: 'publications' as const,
-                        titleEn: 'Publications',
-                        titleFa: 'فهرست انتشارات (Publications)',
+                        titleEn: 'WikIran Publications',
+                        titleFa: 'فهرست انتشارات ویکی‌ایران (Publications)',
                         count: data.stats.publications_count,
                         descEn: 'Catalogue titles, descriptions & file inventory metadata',
                         descFa: 'عناوین فهرست انتشارات، توضیحات و متادیتای موجودی فایل‌ها',
@@ -2835,7 +3699,7 @@ export default function App() {
                       },
                       {
                         key: 'organizations' as const,
-                        titleEn: 'Organizations',
+                        titleEn: 'WikIran Organizations',
                         titleFa: 'سازمان‌ها و نهادها (Organizations)',
                         count: data.stats.organizations_count,
                         descEn: 'Organization names, native names, acronyms & linked articles',
@@ -2845,7 +3709,7 @@ export default function App() {
                       },
                       {
                         key: 'tags' as const,
-                        titleEn: 'Tags',
+                        titleEn: 'WikIran Tags',
                         titleFa: 'برچسب‌ها و کلیدواژه‌ها (Tags)',
                         count: data.tags?.length || 10,
                         descEn: 'Tag slugs, keyword labels, linked article counts & titles',
@@ -2859,13 +3723,13 @@ export default function App() {
                         <label
                           key={ent.key}
                           onClick={() => toggleWizardEntity(ent.key)}
-                          className={`rounded-xl p-4 border-2 transition-all cursor-pointer flex flex-col justify-between space-y-3 select-none ${
+                          className={`rounded-xl p-4 border-2 transition-all cursor-pointer flex flex-col justify-between space-y-2.5 select-none ${
                             isSelected
                               ? `${ent.borderColor} shadow-xs`
-                              : 'bg-white border-slate-200 hover:border-slate-300 opacity-80'
+                              : 'bg-white border-slate-200 hover:border-slate-300 opacity-85'
                           }`}
                         >
-                          <div className="space-y-2">
+                          <div className="space-y-1.5">
                             <div className="flex items-center justify-between gap-2">
                               <input
                                 type="checkbox"
@@ -2876,7 +3740,7 @@ export default function App() {
                               <span
                                 className={`text-xs font-mono-tabular font-bold px-2 py-0.5 rounded ${ent.badgeColor}`}
                               >
-                                {ent.count} {lang === 'fa' ? 'رکورد' : 'records'}
+                                {ent.count.toLocaleString()} {lang === 'fa' ? 'رکورد' : 'records'}
                               </span>
                             </div>
                             <div className="text-sm font-bold text-slate-900">
@@ -2900,57 +3764,603 @@ export default function App() {
                     })}
                   </div>
 
-                  {/* Step 2: Summary & Generate Custom Excel Button */}
-                  <div className="bg-white border border-indigo-200 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
-                    <div className="space-y-1">
-                      <div className="text-xs font-bold text-slate-800">
-                        {lang === 'fa'
-                          ? `شیت‌های انتخاب‌شده برای ساخت فایل اکسل (${wizardEntities.length} شیت):`
-                          : `Selected Worksheets for Custom Excel Report (${wizardEntities.length} sheets):`}
-                      </div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {wizardEntities.length > 0 ? (
-                          wizardEntities.map((key) => (
-                            <span
-                              key={key}
-                              className="px-2.5 py-0.5 text-xs font-mono-tabular font-semibold bg-indigo-100 text-indigo-900 rounded border border-indigo-300 uppercase"
+                  {/* Step 2: Date Range Filter for WikIran Articles & Publications */}
+                  {(() => {
+                    const filterByWizardDates = (pubDate: string) => {
+                      if (!wizardDateFrom && !wizardDateTo) return true;
+                      const d = (pubDate || '').trim().slice(0, 10);
+                      if (!d) return false;
+                      if (wizardDateFrom && d < wizardDateFrom) return false;
+                      if (wizardDateTo && d > wizardDateTo) return false;
+                      return true;
+                    };
+                    const filteredArticlesCount = data.articles.filter((a) =>
+                      filterByWizardDates(a.publication_date)
+                    ).length;
+                    const filteredPubsCount = data.publications.filter((p) =>
+                      filterByWizardDates(p.publication_date)
+                    ).length;
+
+                    const exportParams = new URLSearchParams();
+                    exportParams.set('entities', wizardEntities.join(','));
+                    if (wizardDateFrom) exportParams.set('date_from', wizardDateFrom);
+                    if (wizardDateTo) exportParams.set('date_to', wizardDateTo);
+                    const wizardDownloadHref = `/api/export/xlsx?${exportParams.toString()}`;
+
+                    return (
+                      <>
+                        <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
+                              <Calendar className="w-4 h-4 text-indigo-600 shrink-0" />
+                              <span>
+                                {lang === 'fa'
+                                  ? 'بازه زمانی اختیاری (فیلتر تاریخ انتشار برای مقالات و انتشارات ویکی‌ایران):'
+                                  : 'Optional Date Range Filter (Applies to WikIran Articles & Publications):'}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setWizardDateFrom('2026-01-01');
+                                  setWizardDateTo('2026-12-31');
+                                }}
+                                className="px-2.5 py-1 text-[11px] font-semibold bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-800 border border-slate-300 rounded cursor-pointer"
+                              >
+                                2026
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setWizardDateFrom('2025-01-01');
+                                  setWizardDateTo('2026-12-31');
+                                }}
+                                className="px-2.5 py-1 text-[11px] font-semibold bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-800 border border-slate-300 rounded cursor-pointer"
+                              >
+                                2025–2026
+                              </button>
+                              {(wizardDateFrom || wizardDateTo) && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setWizardDateFrom('');
+                                    setWizardDateTo('');
+                                  }}
+                                  className="px-2.5 py-1 text-[11px] font-semibold bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded cursor-pointer"
+                                >
+                                  {lang === 'fa' ? 'پاک کردن بازه' : 'Clear Dates'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-semibold text-slate-600">
+                                {lang === 'fa' ? 'از تاریخ (Start Date):' : 'Start Date (From):'}
+                              </label>
+                              <input
+                                type="date"
+                                value={wizardDateFrom}
+                                onChange={(e) => setWizardDateFrom(e.target.value)}
+                                className="w-full px-3 py-2 text-xs font-mono-tabular border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-semibold text-slate-600">
+                                {lang === 'fa' ? 'تا تاریخ (End Date):' : 'End Date (To):'}
+                              </label>
+                              <input
+                                type="date"
+                                value={wizardDateTo}
+                                onChange={(e) => setWizardDateTo(e.target.value)}
+                                className="w-full px-3 py-2 text-xs font-mono-tabular border border-slate-300 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                              />
+                            </div>
+                            <div className="px-3 py-2 rounded-md bg-indigo-50/70 border border-indigo-200 text-xs text-indigo-950 font-medium">
+                              {wizardDateFrom || wizardDateTo ? (
+                                <span>
+                                  {lang === 'fa'
+                                    ? `مطابق بازه زمانی: ${filteredArticlesCount} مقاله · ${filteredPubsCount} انتشار`
+                                    : `Matching Date Range: ${filteredArticlesCount} Articles · ${filteredPubsCount} Publications`}
+                                </span>
+                              ) : (
+                                <span className="text-slate-600">
+                                  {lang === 'fa'
+                                    ? 'همه تاریخ‌ها شامل می‌شوند (بدون محدودیت زمانی)'
+                                    : 'All dates included (no date restriction)'}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Step 3: Summary & Generate Custom Excel Button */}
+                        <div className="bg-white border border-indigo-200 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
+                          <div className="space-y-1">
+                            <div className="text-xs font-bold text-slate-800">
+                              {lang === 'fa'
+                                ? `شیت‌های انتخاب‌شده برای ساخت فایل اکسل (${wizardEntities.length} شیت):`
+                                : `Selected Worksheets for Custom Excel Report (${wizardEntities.length} sheets):`}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {wizardEntities.length > 0 ? (
+                                <>
+                                  {wizardEntities.map((key) => (
+                                    <span
+                                      key={key}
+                                      className={`px-2.5 py-0.5 text-xs font-mono-tabular font-semibold rounded border uppercase ${
+                                        key.startsWith('ofac')
+                                          ? 'bg-rose-100 text-rose-900 border-rose-300'
+                                          : 'bg-indigo-100 text-indigo-900 border-indigo-300'
+                                      }`}
+                                    >
+                                      {key.replace('_', ' ')}
+                                    </span>
+                                  ))}
+                                  {(wizardDateFrom || wizardDateTo) && (
+                                    <span className="px-2.5 py-0.5 text-xs font-mono-tabular font-semibold bg-amber-100 text-amber-950 rounded border border-amber-300">
+                                      {wizardDateFrom || '…'} → {wizardDateTo || '…'}
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="text-xs text-red-600 font-semibold">
+                                  {lang === 'fa'
+                                    ? 'لطفاً حداقل یک بخش را انتخاب کنید.'
+                                    : 'Please select at least one data entity above.'}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {wizardEntities.length > 0 ? (
+                            <a
+                              href={wizardDownloadHref}
+                              className="px-5 py-2.5 text-xs sm:text-sm font-bold text-white bg-indigo-700 hover:bg-indigo-800 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs"
                             >
-                              {key}
-                            </span>
-                          ))
-                        ) : (
-                          <span className="text-xs text-red-600 font-semibold">
+                              <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                              <span>
+                                {lang === 'fa'
+                                  ? `دانلود گزارش اکسل سفارشی (${wizardEntities.length} شیت)`
+                                  : `Download Custom Excel Report (${wizardEntities.length} Sheets)`}
+                              </span>
+                            </a>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled
+                              className="px-5 py-2.5 text-xs sm:text-sm font-bold text-slate-400 bg-slate-200 rounded-lg cursor-not-allowed"
+                            >
+                              {lang === 'fa'
+                                ? 'حداقل یک بخش را انتخاب کنید'
+                                : 'Select at Least 1 Entity'}
+                            </button>
+                          )}
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              </section>
+
+              {/* SECTION 2: STYLISH HUMAN-READABLE DATA CONVERTER & VIEWER (OFAC + UPLOADED CSV -> EXCEL) */}
+              <section className="bg-white border-2 border-emerald-300 rounded-xl overflow-hidden shadow-xs">
+                <div className="bg-gradient-to-r from-slate-900 via-emerald-950 to-slate-900 text-white px-5 sm:px-6 py-5 flex flex-wrap items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="text-xs font-bold text-emerald-300 uppercase tracking-wider">
+                      {lang === 'fa'
+                        ? 'مبدل خوانا و هوشمند فایل‌های خام CSV / OFAC به جدول انسانی و اکسل'
+                        : 'HUMAN-READABLE DATA CONVERTER · RAW CSV / OFAC TO STYLED TABLE & EXCEL'}
+                    </div>
+                    <h3 className="text-lg font-bold text-white">
+                      {lang === 'fa'
+                        ? 'نمایشگر و مبدل خوانای داده‌های اوفک و فایل‌های CSV'
+                        : 'Human-Readable OFAC & CSV-to-Excel Converter'}
+                    </h3>
+                    <p className="text-xs text-emerald-100/90 max-w-3xl leading-relaxed">
+                      {lang === 'fa'
+                        ? 'به‌جای باز کردن فایل‌های خام و شلوغ CSV، اینجا می‌توانید لیست تحریم‌های ایران اوفک یا هر فایل CSV دلخواه (از اوفک، ویکی‌ایران یا شیت‌های تجاری) را در یک جدول خوانا و مرتب ببینید و با یک کلیک به اکسل (.xlsx) تبدیل کنید.'
+                        : 'Inspect OFAC Iran sanctions or drop any raw .CSV spreadsheet to instantly transform ugly raw CSV text into a clean, color-coded human-readable table and download it as a formatted Excel (.xlsx) workbook.'}
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <label className="px-4 py-2 text-xs font-bold text-emerald-950 bg-emerald-300 hover:bg-emerald-200 rounded-lg transition-colors inline-flex items-center gap-2 cursor-pointer shadow-xs">
+                      <Upload className="w-4 h-4" />
+                      <span>{t.csvUploadBtn}</span>
+                      <input
+                        type="file"
+                        accept=".csv,text/csv"
+                        onChange={(e) => {
+                          setConverterTab('csv');
+                          handleCsvFileUpload(e);
+                        }}
+                        className="hidden"
+                      />
+                    </label>
+                    {converterTab === 'ofac_iran' ? (
+                      <a
+                        href="/api/export/xlsx?entities=ofac_iran"
+                        className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-500 border border-rose-400 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs"
+                      >
+                        <FileSpreadsheet className="w-4 h-4" />
+                        <span>
+                          {lang === 'fa'
+                            ? 'دانلود کل اوفک ایران به اکسل (.xlsx)'
+                            : 'Download OFAC Iran Excel (.xlsx)'}
+                        </span>
+                      </a>
+                    ) : currentCsvDataset && currentCsvDataset.id > 0 ? (
+                      <a
+                        href={`/api/csv/download/${currentCsvDataset.id}`}
+                        className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 border border-emerald-400 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs"
+                      >
+                        <FileSpreadsheet className="w-4 h-4" />
+                        <span>{t.csvDownloadXlsxBtn}</span>
+                      </a>
+                    ) : null}
+                  </div>
+                </div>
+
+                {/* Mode Switcher Tabs: Live Human-Readable OFAC Iran Viewer vs CSV File Converter */}
+                <div className="px-5 py-3 bg-slate-100 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setConverterTab('ofac_iran')}
+                      className={`px-3.5 py-1.5 text-xs font-bold rounded-md transition-colors cursor-pointer ${
+                        converterTab === 'ofac_iran'
+                          ? 'bg-rose-700 text-white shadow-2xs'
+                          : 'bg-white text-slate-700 border border-slate-300 hover:bg-rose-50'
+                      }`}
+                    >
+                      {lang === 'fa'
+                        ? `جدول خوانای اوفک ایران (${(data.ofac_summary?.iran_related_count ?? 0).toLocaleString()} رکورد)`
+                        : `Human-Readable OFAC Iran Viewer (${(data.ofac_summary?.iran_related_count ?? 0).toLocaleString()})`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConverterTab('csv')}
+                      className={`px-3.5 py-1.5 text-xs font-bold rounded-md transition-colors cursor-pointer ${
+                        converterTab === 'csv'
+                          ? 'bg-emerald-700 text-white shadow-2xs'
+                          : 'bg-white text-slate-700 border border-slate-300 hover:bg-emerald-50'
+                      }`}
+                    >
+                      {lang === 'fa'
+                        ? `مبدل فایل‌های CSV به اکسل (${(data.csv_datasets || []).length} جدول)`
+                        : `Uploaded CSV-to-Excel Converter (${(data.csv_datasets || []).length} Tables)`}
+                    </button>
+                  </div>
+
+                  {converterTab === 'ofac_iran' && (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={ofacViewerQuery}
+                        onChange={(e) => setOfacViewerQuery(e.target.value)}
+                        placeholder={
+                          lang === 'fa'
+                            ? 'فیلتر سریع در پیش‌نمایش اوفک ایران...'
+                            : 'Filter preview by name, alias, or program...'
+                        }
+                        className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md w-64 focus:outline-none focus:ring-2 focus:ring-rose-500"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveNav('search');
+                          setFilterType('OFAC_SANCTION');
+                          setSearchQuery(ofacViewerQuery || 'IRAN');
+                          runUniversalSearchWithQuery(ofacViewerQuery || 'IRAN', {
+                            type: 'OFAC_SANCTION',
+                          });
+                        }}
+                        className="px-3 py-1.5 text-xs font-bold text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-md cursor-pointer"
+                      >
+                        {lang === 'fa'
+                          ? `جستجو در کل ${(data.ofac_summary?.total_entities ?? 0).toLocaleString()} رکورد ←`
+                          : `Search All ${(data.ofac_summary?.total_entities ?? 0).toLocaleString()} →`}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {converterTab === 'ofac_iran' ? (
+                  (() => {
+                    const sampleRows = (data.ofac_summary?.sample_iran_entities || []).filter((r) => {
+                      const needle = ofacViewerQuery.trim().toLowerCase();
+                      if (!needle) return true;
+                      const hay = `${r.sdn_name || ''} ${r.programs || ''} ${r.aliases_text || ''} ${r.countries_text || ''} ${r.remarks || ''}`.toLowerCase();
+                      return hay.includes(needle);
+                    });
+
+                    return (
+                      <div className="divide-y divide-slate-200">
+                        <div className="px-5 py-2.5 bg-rose-50/50 text-xs text-rose-950 flex flex-wrap items-center justify-between gap-2">
+                          <span>
                             {lang === 'fa'
-                              ? 'لطفاً حداقل یک بخش را انتخاب کنید.'
-                              : 'Please select at least one data entity above.'}
+                              ? `پیش‌نمایش خوانای جدیدترین رکوردهای تحریمی مرتبط با ایران (برای دریافت کامل هر ${(data.ofac_summary?.iran_related_count ?? 0).toLocaleString()} رکورد، روی دکمه دانلود اکسل بالا کلیک کنید).`
+                              : `Clean human-readable preview of recent Iran-linked OFAC designations (click "Download OFAC Iran Excel (.xlsx)" above for all ${(data.ofac_summary?.iran_related_count ?? 0).toLocaleString()} records).`}
                           </span>
+                          <span className="font-mono-tabular font-semibold text-rose-800">
+                            Pub #{data.ofac_summary?.last_publication_id || '—'}
+                          </span>
+                        </div>
+                        <div className="overflow-x-auto max-h-[520px]">
+                          <table className="w-full text-xs text-start border-collapse">
+                            <thead>
+                              <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 sticky top-0">
+                                <th className="py-2.5 px-4 text-start font-bold">OFAC ID</th>
+                                <th className="py-2.5 px-4 text-start font-bold">
+                                  {lang === 'fa' ? 'نام و نوع' : 'Primary Name & Type'}
+                                </th>
+                                <th className="py-2.5 px-4 text-start font-bold">
+                                  {lang === 'fa' ? 'برنامه‌های تحریمی' : 'Sanctions Programs'}
+                                </th>
+                                <th className="py-2.5 px-4 text-start font-bold">
+                                  {lang === 'fa' ? 'اسامی مستعار (AKA) و کشورها' : 'Aliases (AKA) & Countries'}
+                                </th>
+                                <th className="py-2.5 px-4 text-start font-bold">
+                                  {lang === 'fa' ? 'توضیحات رسمی' : 'Remarks'}
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-200">
+                              {sampleRows.map((r, i) => {
+                                const progs = String(r.programs || '')
+                                  .replace(/\]\s*\[/g, '; ')
+                                  .split(';')
+                                  .map((p) => p.trim())
+                                  .filter(Boolean);
+                                return (
+                                  <tr
+                                    key={`${String(r.ent_num)}-${i}`}
+                                    className="hover:bg-rose-50/40 even:bg-slate-50/40 transition-colors"
+                                  >
+                                    <td className="py-3 px-4 font-mono-tabular whitespace-nowrap">
+                                      <div className="font-bold text-rose-800">
+                                        #{String(r.ent_num)}
+                                      </div>
+                                      <span className="inline-block mt-1 px-1.5 py-0.5 text-[10px] font-bold rounded bg-rose-100 text-rose-900">
+                                        {String(r.list_source || 'SDN')}
+                                      </span>
+                                    </td>
+                                    <td className="py-3 px-4 min-w-[200px]">
+                                      <div className="font-bold text-slate-900 text-xs">
+                                        {String(r.sdn_name || '')}
+                                      </div>
+                                      <span className="inline-block mt-1 px-1.5 py-0.5 text-[10px] font-semibold uppercase bg-slate-200 text-slate-700 rounded">
+                                        {String(r.sdn_type || 'entity')}
+                                      </span>
+                                    </td>
+                                    <td className="py-3 px-4 min-w-[160px]">
+                                      <div className="flex flex-wrap gap-1">
+                                        {progs.map((p) => (
+                                          <span
+                                            key={p}
+                                            className="px-1.5 py-0.5 text-[10px] font-mono-tabular font-bold bg-rose-100 text-rose-900 border border-rose-200 rounded"
+                                          >
+                                            {p}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </td>
+                                    <td className="py-3 px-4 max-w-xs space-y-1 text-slate-700">
+                                      {r.countries_text ? (
+                                        <div className="font-semibold text-slate-900">
+                                          {String(r.countries_text)}
+                                        </div>
+                                      ) : null}
+                                      {r.aliases_text ? (
+                                        <div className="text-[11px] text-slate-600 line-clamp-2">
+                                          {String(r.aliases_text)}
+                                        </div>
+                                      ) : (
+                                        <span className="text-slate-400">—</span>
+                                      )}
+                                    </td>
+                                    <td className="py-3 px-4 max-w-sm text-[11px] text-slate-600 leading-relaxed">
+                                      {String(r.remarks || '—').slice(0, 220)}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <>
+                    {/* Dataset Selector, Instant Search & Preview All Controls */}
+                    <div className="p-4 sm:p-5 bg-emerald-50/60 border-b border-emerald-200 space-y-4">
+                      <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-xs font-semibold text-emerald-950">
+                            {lang === 'fa' ? 'جدول فعال:' : 'Active CSV Table:'}
+                          </span>
+                          {(data.csv_datasets || []).map((ds) => (
+                            <button
+                              key={ds.id}
+                              onClick={() =>
+                                handleCsvFilterChange(ds.id, csvFilterQuery, csvPreviewAll, false)
+                              }
+                              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                                !csvCrossDatasetAudit && currentCsvDataset?.id === ds.id
+                                  ? 'bg-emerald-700 text-white'
+                                  : 'bg-white text-emerald-900 border border-emerald-300 hover:bg-emerald-100'
+                              }`}
+                            >
+                              {ds.dataset_name} ({ds.row_count})
+                            </button>
+                          ))}
+                          <button
+                            onClick={() =>
+                              handleCsvFilterChange(
+                                selectedCsvId,
+                                csvFilterQuery,
+                                true,
+                                !csvCrossDatasetAudit
+                              )
+                            }
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                              csvCrossDatasetAudit
+                                ? 'bg-indigo-700 text-white'
+                                : 'bg-white text-indigo-900 border border-indigo-300 hover:bg-indigo-50'
+                            }`}
+                          >
+                            <Layers className="w-3.5 h-3.5" />
+                            <span>{t.csvCrossDatasetBtn}</span>
+                          </button>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="relative flex-1 min-w-[220px]">
+                            <input
+                              type="text"
+                              value={csvFilterQuery}
+                              onChange={(e) =>
+                                handleCsvFilterChange(
+                                  currentCsvDataset?.id ?? selectedCsvId,
+                                  e.target.value,
+                                  csvPreviewAll,
+                                  csvCrossDatasetAudit
+                                )
+                              }
+                              placeholder={t.csvSearchPlaceholder}
+                              className="w-full px-3 py-1.5 text-xs bg-white border border-emerald-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                            />
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCsvFilterChange(
+                                currentCsvDataset?.id ?? selectedCsvId,
+                                csvFilterQuery,
+                                !csvPreviewAll,
+                                csvCrossDatasetAudit
+                              )
+                            }
+                            className={`px-3.5 py-1.5 text-xs font-bold rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer ${
+                              csvPreviewAll
+                                ? 'bg-amber-600 text-white hover:bg-amber-700'
+                                : 'bg-emerald-800 text-white hover:bg-emerald-900'
+                            }`}
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>
+                              {csvPreviewAll ? t.csvPreviewSubsetBtn : t.csvPreviewAllBtn}
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 bg-white border border-emerald-200 rounded-md text-xs">
+                        <div className="font-semibold text-slate-800">
+                          {lang === 'fa' ? (
+                            <span>
+                              نمایش{' '}
+                              <span className="font-mono-tabular text-emerald-800">
+                                {displayedCsvCount}
+                              </span>{' '}
+                              رکورد از مجموع{' '}
+                              <span className="font-mono-tabular text-emerald-800">
+                                {totalCsvMatching}
+                              </span>{' '}
+                              رکورد منطبق
+                            </span>
+                          ) : (
+                            <span>
+                              Showing{' '}
+                              <span className="font-mono-tabular text-emerald-800">
+                                {displayedCsvCount}
+                              </span>{' '}
+                              of{' '}
+                              <span className="font-mono-tabular text-emerald-800">
+                                {totalCsvMatching}
+                              </span>{' '}
+                              matching records
+                            </span>
+                          )}
+                        </div>
+
+                        {isCsvSubset && !csvPreviewAll && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCsvFilterChange(
+                                currentCsvDataset?.id ?? selectedCsvId,
+                                csvFilterQuery,
+                                true,
+                                csvCrossDatasetAudit
+                              )
+                            }
+                            className="text-xs font-bold text-indigo-700 hover:text-indigo-950 underline inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>
+                              {lang === 'fa'
+                                ? `مشاهده هر ${totalCsvMatching} رکورد منطبق ←`
+                                : `Preview all ${totalCsvMatching} matching records →`}
+                            </span>
+                          </button>
                         )}
                       </div>
                     </div>
 
-                    {wizardEntities.length > 0 ? (
-                      <a
-                        href={`/api/export/xlsx?entities=${wizardEntities.join(',')}`}
-                        className="px-5 py-2.5 text-xs sm:text-sm font-bold text-white bg-indigo-700 hover:bg-indigo-800 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs"
+                    {currentCsvDataset ? (
+                      <div
+                        className={`overflow-x-auto ${csvPreviewAll ? 'max-h-[640px]' : 'max-h-96'}`}
                       >
-                        <FileSpreadsheet className="w-4 h-4 shrink-0" />
-                        <span>
-                          {lang === 'fa'
-                            ? `دانلود گزارش اکسل سفارشی (${wizardEntities.length} شیت انتخابی)`
-                            : `Download Custom Excel Report (${wizardEntities.length} Selected Sheets)`}
-                        </span>
-                      </a>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled
-                        className="px-5 py-2.5 text-xs sm:text-sm font-bold text-slate-400 bg-slate-200 rounded-lg cursor-not-allowed"
-                      >
-                        {lang === 'fa' ? 'حداقل یک بخش را انتخاب کنید' : 'Select at Least 1 Entity'}
-                      </button>
-                    )}
-                  </div>
-                </div>
+                        <table className="w-full text-xs text-start border-collapse">
+                          <thead>
+                            <tr className="bg-slate-100 border-b border-slate-300 text-slate-700 sticky top-0">
+                              <th className="py-2.5 px-3 border-e border-slate-300 font-mono-tabular text-center w-12 bg-slate-200">
+                                #
+                              </th>
+                              {currentCsvDataset.headers.map((h) => (
+                                <th
+                                  key={h}
+                                  className="py-2.5 px-4 border-e border-slate-200 font-bold text-slate-800 whitespace-nowrap"
+                                >
+                                  {h}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200">
+                            {currentCsvRows.map((r) => (
+                              <tr
+                                key={`${r.id}-${r.row_number}`}
+                                className="hover:bg-emerald-50/60 transition-colors even:bg-slate-50/60"
+                              >
+                                <td className="py-2.5 px-3 border-e border-slate-200 font-mono-tabular text-center text-slate-500 bg-slate-100/70 font-semibold">
+                                  {r.row_number}
+                                </td>
+                                {currentCsvDataset.headers.map((h) => (
+                                  <td
+                                    key={h}
+                                    className={`py-2.5 px-4 border-e border-slate-100 text-slate-800 ${
+                                      csvPreviewAll ? 'min-w-[160px]' : 'max-w-xs truncate'
+                                    }`}
+                                    title={r.cells[h] || ''}
+                                  >
+                                    {r.cells[h] || ''}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                  </>
+                )}
               </section>
 
               {/* Standard Archive Export Cards (.xlsx, .csv, .json) */}
