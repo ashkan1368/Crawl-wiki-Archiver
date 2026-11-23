@@ -3,6 +3,8 @@ export type Language = 'en' | 'fa';
 export type NavSection =
   | 'dashboard'
   | 'search'
+  | 'watchlist'
+  | 'targeted_leaks'
   | 'articles'
   | 'publications'
   | 'organizations'
@@ -18,6 +20,8 @@ export const UI_LABELS: Record<Language, Record<string, string>> = {
     appSubtitle: 'Windows 11 Local Research Archive & Spreadsheet Workbench (PySide6 + SQLite FTS5)',
     nav_dashboard: 'Dashboard',
     nav_search: 'Search Archive',
+    nav_watchlist: 'Batch Watchlist Screener',
+    nav_targeted_leaks: 'Targeted Leak Downloader',
     nav_articles: 'Articles',
     nav_publications: 'Publication Catalogue',
     nav_organizations: 'Organizations',
@@ -163,6 +167,8 @@ export const UI_LABELS: Record<Language, Record<string, string>> = {
     appSubtitle: 'سامانه آرشیو جامع، جستجوی عمیق و مبدل CSV به اکسل (PySide6 + SQLite FTS5)',
     nav_dashboard: 'پیشخوان و راهنمای شروع',
     nav_search: 'جستجو در کل داده‌ها',
+    nav_watchlist: 'غربالگری گروهی فهرست (Excel/CSV)',
+    nav_targeted_leaks: 'دانلود هدفمند افشاگری‌ها',
     nav_articles: 'مقالات تحلیلی',
     nav_publications: 'فهرست انتشارات و اسناد',
     nav_organizations: 'سازمان‌ها و نهادها',

@@ -408,6 +408,67 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         CREATE INDEX IF NOT EXISTS idx_ofac_sdn_name ON ofac_entities(sdn_name);
         CREATE INDEX IF NOT EXISTS idx_ofac_programs ON ofac_entities(programs);
         CREATE INDEX IF NOT EXISTS idx_ofac_countries ON ofac_entities(countries_text);
+
+        CREATE TABLE IF NOT EXISTS opensanctions_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            os_id TEXT NOT NULL UNIQUE,
+            schema_type TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            aliases TEXT NOT NULL DEFAULT '',
+            birth_date TEXT NOT NULL DEFAULT '',
+            countries TEXT NOT NULL DEFAULT '',
+            addresses TEXT NOT NULL DEFAULT '',
+            identifiers TEXT NOT NULL DEFAULT '',
+            sanctions TEXT NOT NULL DEFAULT '',
+            phones TEXT NOT NULL DEFAULT '',
+            emails TEXT NOT NULL DEFAULT '',
+            program_ids TEXT NOT NULL DEFAULT '',
+            datasets TEXT NOT NULL DEFAULT '',
+            first_seen TEXT NOT NULL DEFAULT '',
+            last_seen TEXT NOT NULL DEFAULT '',
+            last_change TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            retrieved_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_os_name ON opensanctions_entities(name);
+        CREATE INDEX IF NOT EXISTS idx_os_schema ON opensanctions_entities(schema_type);
+        CREATE INDEX IF NOT EXISTS idx_os_countries ON opensanctions_entities(countries);
+        CREATE INDEX IF NOT EXISTS idx_os_datasets ON opensanctions_entities(datasets);
+
+        CREATE TABLE IF NOT EXISTS crawl_frontier (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            url_type TEXT NOT NULL DEFAULT 'ARTICLE',
+            source_hub TEXT NOT NULL DEFAULT '',
+            depth INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            discovered_at TEXT NOT NULL,
+            last_checked_at TEXT,
+            error_message TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_frontier_status ON crawl_frontier(status);
+        CREATE INDEX IF NOT EXISTS idx_frontier_type ON crawl_frontier(url_type);
+
+        CREATE TABLE IF NOT EXISTS wikiran_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id TEXT NOT NULL UNIQUE,
+            doc_type TEXT NOT NULL DEFAULT 'LEAKED_FILE',
+            title TEXT NOT NULL,
+            snippet TEXT NOT NULL DEFAULT '',
+            leak_sources TEXT NOT NULL DEFAULT '',
+            country_or_flag TEXT NOT NULL DEFAULT '',
+            bank_or_operator TEXT NOT NULL DEFAULT '',
+            identifier_or_imo TEXT NOT NULL DEFAULT '',
+            document_date TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL UNIQUE,
+            retrieved_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wdoc_type ON wikiran_documents(doc_type);
+        CREATE INDEX IF NOT EXISTS idx_wdoc_title ON wikiran_documents(title);
+        CREATE INDEX IF NOT EXISTS idx_wdoc_sources ON wikiran_documents(leak_sources);
         """
     )
     conn.execute("PRAGMA foreign_keys = ON;")

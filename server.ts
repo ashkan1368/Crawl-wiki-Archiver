@@ -1,6 +1,7 @@
 import express from 'express';
 import { execFile } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
@@ -8,22 +9,34 @@ import { createServer as createViteServer } from 'vite';
 const execFileAsync = promisify(execFile);
 
 async function runPythonAction(action: string, payload: Record<string, unknown> = {}) {
-  const { stdout } = await execFileAsync(
-    'python3',
-    ['-m', 'wikiran_archive.main', '--api', action, '--payload', JSON.stringify(payload)],
-    {
+  const serialized = JSON.stringify(payload);
+  let tmpPayloadPath: string | null = null;
+  const cliArgs = ['-m', 'wikiran_archive.main', '--api', action];
+  if (serialized.length > 32768) {
+    tmpPayloadPath = path.join(os.tmpdir(), `wikiran_payload_${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(tmpPayloadPath, serialized, 'utf-8');
+    cliArgs.push('--payload-file', tmpPayloadPath);
+  } else {
+    cliArgs.push('--payload', serialized);
+  }
+  try {
+    const { stdout } = await execFileAsync('python3', cliArgs, {
       cwd: process.cwd(),
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: 25 * 1024 * 1024,
+    });
+    return JSON.parse(stdout);
+  } finally {
+    if (tmpPayloadPath) {
+      fs.unlink(tmpPayloadPath, () => {});
     }
-  );
-  return JSON.parse(stdout);
+  }
 }
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '20mb' }));
 
   app.get('/api/overview', async (_req, res) => {
     try {
@@ -115,6 +128,33 @@ async function startServer() {
     }
   });
 
+  app.get('/api/opensanctions/status', async (_req, res) => {
+    try {
+      const data = await runPythonAction('opensanctions_status', {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/opensanctions/sync', async (req, res) => {
+    try {
+      const data = await runPythonAction('opensanctions_sync', req.body || {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/wikiran/sync-archives', async (req, res) => {
+    try {
+      const data = await runPythonAction('wikiran_sync_archives', req.body || {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/resume-job', async (req, res) => {
     try {
       const data = await runPythonAction('resume_job', req.body || {});
@@ -195,6 +235,200 @@ async function startServer() {
     }
   });
 
+  app.get('/api/watchlist/template/:format', async (req, res) => {
+    try {
+      const fmt = req.params.format === 'csv' ? 'csv' : 'xlsx';
+      const data = await runPythonAction('watchlist_template', { format: fmt });
+      if (!data.ok || !data.path || !fs.existsSync(data.path)) {
+        res.status(500).json({ ok: false, error: 'Watchlist template could not be generated.' });
+        return;
+      }
+      res.download(data.path, data.filename || `WikIran_Batch_Watchlist_Template.${fmt}`);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/watchlist/screen', async (req, res) => {
+    try {
+      const data = await runPythonAction('watchlist_screen', req.body || {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/watchlist/report/download', (req, res) => {
+    try {
+      const reqPath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+      const low = reqPath.toLowerCase();
+      if (
+        !reqPath ||
+        (!low.endsWith('.xlsx') && !low.endsWith('.csv')) ||
+        !path.basename(reqPath).startsWith('WikIran_Watchlist_Risk_Report_') ||
+        !fs.existsSync(reqPath)
+      ) {
+        res.status(404).json({ ok: false, error: 'Watchlist risk report file not found.' });
+        return;
+      }
+      res.download(reqPath, path.basename(reqPath));
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/leaks/catalog', async (req, res) => {
+    try {
+      const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+      const data = await runPythonAction('leaks_catalog', { refresh });
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/leaks/download', async (req, res) => {
+    try {
+      const data = await runPythonAction('leaks_download', req.body || {});
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  let cachedFullPortableZipPath = '';
+  let cachedFullBackupZipPath = '';
+
+  app.get('/api/download/windows-portable-lite-zip', async (_req, res) => {
+    try {
+      const data = await runPythonAction('windows_portable_lite_zip');
+      if (!data.ok || !data.path || !fs.existsSync(data.path)) {
+        res.status(500).json({ ok: false, error: 'Portable Windows Release ZIP could not be generated.' });
+        return;
+      }
+      res.download(data.path, data.filename || 'WikIranArchive_Portable_Windows_Release.zip');
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/download/windows-portable-prepare', async (_req, res) => {
+    try {
+      const data = await runPythonAction('windows_portable_zip');
+      if (!data.ok || !data.path || !fs.existsSync(data.path)) {
+        res.status(500).json({ ok: false, error: 'Full Portable Windows ZIP could not be generated.' });
+        return;
+      }
+      cachedFullPortableZipPath = data.path;
+      const sizeBytes = fs.statSync(data.path).size;
+      const chunkSize = 8 * 1024 * 1024; // 8 MB per chunk (well under Cloud Run's 32 MB limit)
+      res.json({
+        ok: true,
+        filename: data.filename || 'WikIranArchive_Portable_Windows.zip',
+        size_bytes: sizeBytes,
+        chunk_size: chunkSize,
+        total_chunks: Math.ceil(sizeBytes / chunkSize),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/download/windows-portable-chunk', (req, res) => {
+    try {
+      const zipPath = cachedFullPortableZipPath;
+      if (!zipPath || !fs.existsSync(zipPath)) {
+        res.status(404).json({ ok: false, error: 'Portable ZIP not prepared yet. Call prepare first.' });
+        return;
+      }
+      const stat = fs.statSync(zipPath);
+      const offset = Math.max(0, Number(req.query.offset || 0));
+      const reqLen = Math.min(16 * 1024 * 1024, Math.max(1, Number(req.query.length || 8 * 1024 * 1024)));
+      if (offset >= stat.size) {
+        res.status(416).json({ ok: false, error: 'Offset out of range.' });
+        return;
+      }
+      const end = Math.min(stat.size - 1, offset + reqLen - 1);
+      const chunkLen = end - offset + 1;
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', String(chunkLen));
+      res.setHeader('Cache-Control', 'no-store');
+      fs.createReadStream(zipPath, { start: offset, end }).pipe(res);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/backup/full-prepare', async (req, res) => {
+    try {
+      const requestedPath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+      let zipPath = '';
+      let filename = 'WikIran_Full_Portable_Backup.zip';
+      if (requestedPath && fs.existsSync(requestedPath) && requestedPath.toLowerCase().endsWith('.zip')) {
+        zipPath = requestedPath;
+        filename = path.basename(requestedPath);
+      } else {
+        const data = await runPythonAction('backup_full_create');
+        zipPath = data?.backup?.path || '';
+        filename = data?.backup?.filename || filename;
+      }
+      if (!zipPath || !fs.existsSync(zipPath)) {
+        res.status(500).json({ ok: false, error: 'Full backup ZIP could not be prepared.' });
+        return;
+      }
+      cachedFullBackupZipPath = zipPath;
+      const sizeBytes = fs.statSync(zipPath).size;
+      const chunkSize = 8 * 1024 * 1024;
+      res.json({
+        ok: true,
+        filename,
+        size_bytes: sizeBytes,
+        chunk_size: chunkSize,
+        total_chunks: Math.ceil(sizeBytes / chunkSize),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/backup/full-chunk', (req, res) => {
+    try {
+      const zipPath = cachedFullBackupZipPath;
+      if (!zipPath || !fs.existsSync(zipPath)) {
+        res.status(404).json({ ok: false, error: 'Backup ZIP not prepared yet.' });
+        return;
+      }
+      const stat = fs.statSync(zipPath);
+      const offset = Math.max(0, Number(req.query.offset || 0));
+      const reqLen = Math.min(16 * 1024 * 1024, Math.max(1, Number(req.query.length || 8 * 1024 * 1024)));
+      if (offset >= stat.size) {
+        res.status(416).json({ ok: false, error: 'Offset out of range.' });
+        return;
+      }
+      const end = Math.min(stat.size - 1, offset + reqLen - 1);
+      const chunkLen = end - offset + 1;
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', String(chunkLen));
+      res.setHeader('Cache-Control', 'no-store');
+      fs.createReadStream(zipPath, { start: offset, end }).pipe(res);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/download/windows-portable-zip', async (_req, res) => {
+    try {
+      const data = await runPythonAction('windows_portable_lite_zip');
+      if (!data.ok || !data.path || !fs.existsSync(data.path)) {
+        res.status(500).json({ ok: false, error: 'Portable Windows ZIP could not be generated.' });
+        return;
+      }
+      res.download(data.path, data.filename || 'WikIranArchive_Portable_Windows_Release.zip');
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/download/windows-package', async (_req, res) => {
     try {
       const data = await runPythonAction('windows_package');
@@ -265,6 +499,61 @@ async function startServer() {
       res.json(data);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/backup/full-create', async (_req, res) => {
+    try {
+      const data = await runPythonAction('backup_full_create');
+      res.json(data);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/backup/full-download', async (req, res) => {
+    try {
+      const requestedPath =
+        typeof req.query.path === 'string' && req.query.path.trim()
+          ? req.query.path.trim()
+          : '';
+      if (requestedPath && fs.existsSync(requestedPath) && requestedPath.endsWith('.zip')) {
+        res.download(requestedPath, path.basename(requestedPath));
+        return;
+      }
+      const data = await runPythonAction('backup_full_create');
+      const zipPath = data?.backup?.path;
+      if (!data?.ok || !zipPath || !fs.existsSync(zipPath)) {
+        res.status(500).json({ ok: false, error: 'Full portable backup package could not be generated.' });
+        return;
+      }
+      res.download(zipPath, data.backup.filename || 'WikIran_Full_Portable_Backup.zip');
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/backup/full-restore-upload', async (req, res) => {
+    const rawName = String(req.headers['x-backup-filename'] || 'uploaded_backup.zip');
+    const ext = rawName.toLowerCase().endsWith('.db') ? '.db' : '.zip';
+    const tmpFile = path.join(os.tmpdir(), `wikiran_restore_${Date.now()}${ext}`);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ws = fs.createWriteStream(tmpFile);
+        req.pipe(ws);
+        ws.on('finish', () => resolve());
+        ws.on('error', reject);
+        req.on('error', reject);
+      });
+      const data = await runPythonAction('backup_full_restore', {
+        path: tmpFile,
+        confirmed: true,
+      });
+      res.json(data);
+    } catch (err) {
+      res.status(400).json({ ok: false, error: String(err) });
+    } finally {
+      fs.unlink(tmpFile, () => {});
     }
   });
 

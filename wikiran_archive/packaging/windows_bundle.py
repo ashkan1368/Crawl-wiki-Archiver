@@ -1697,3 +1697,281 @@ def build_windows11_self_extracting_bat(
     """Compatibility alias returning the standalone Windows installer `WikIranArchive_Setup.exe`."""
     return build_windows11_setup_exe(project_root, paths, repo)
 
+
+def build_windows_portable_zip(
+    project_root: Path,
+    paths: AppPaths,
+    repo: ArchiveRepository,
+    *,
+    include_database: bool = True,
+) -> Path:
+    """
+    Build a 100% Portable Windows 11 Edition ZIP with ZERO `.exe` files
+    (eliminates Windows Defender / SmartScreen unsigned .exe blocks) and ZERO installation wizard.
+
+    - include_database=True  -> `WikIranArchive_Portable_Windows.zip` (~72 MB, pre-loaded with all offline OFAC/OpenSanctions/WikIran records)
+    - include_database=False -> `WikIranArchive_Portable_Windows_Release.zip` (~1.0 MB, instant direct download; syncs datasets fresh on first launch)
+    """
+    import sqlite3
+    import tempfile
+
+    dist_dir = project_root / "dist"
+    if not (dist_dir / "index.html").exists() or not list((dist_dir / "assets").glob("*.js")):
+        subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(project_root),
+            check=False,
+            capture_output=True,
+        )
+
+    zip_filename = (
+        "WikIranArchive_Portable_Windows.zip"
+        if include_database
+        else "WikIranArchive_Portable_Windows_Release.zip"
+    )
+    zip_path = paths.exports_dir / zip_filename
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    install_prereq_bat = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "title WikIran Archive - Step 1: Check & Install Prerequisites\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "echo ===================================================================\r\n"
+        "echo   WikIran Archive (Portable Edition) - Prerequisite Setup\r\n"
+        "echo   No installation wizard. No unsigned .exe. Runs right from here.\r\n"
+        "echo ===================================================================\r\n"
+        "echo.\r\n"
+        "set \"PY_CMD=\"\r\n"
+        "for /f \"delims=\" %%P in ('where python 2^>nul') do (\r\n"
+        "    echo %%P | findstr /I \"WindowsApps\" >nul\r\n"
+        "    if errorlevel 1 (\r\n"
+        "        set \"PY_CMD=%%P\"\r\n"
+        "        goto :found_python\r\n"
+        "    )\r\n"
+        ")\r\n"
+        "if exist \"%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\" set \"PY_CMD=%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\" & goto :found_python\r\n"
+        "if exist \"%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe\" set \"PY_CMD=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe\" & goto :found_python\r\n"
+        "if exist \"%ProgramFiles%\\Python311\\python.exe\" set \"PY_CMD=%ProgramFiles%\\Python311\\python.exe\" & goto :found_python\r\n"
+        "if exist \"%ProgramFiles%\\Python312\\python.exe\" set \"PY_CMD=%ProgramFiles%\\Python312\\python.exe\" & goto :found_python\r\n"
+        "\r\n"
+        "echo [1/2] Python 3.11+ was not found on this PC.\r\n"
+        "echo Attempting automatic installation of official signed Python 3.11 via winget...\r\n"
+        "where winget >nul 2>&1\r\n"
+        "if %errorlevel%==0 (\r\n"
+        "    winget install -e --id Python.Python.3.11 --scope user --accept-package-agreements --accept-source-agreements\r\n"
+        ") else (\r\n"
+        "    echo winget not available. Opening official python.org download page...\r\n"
+        "    echo Please install Python 3.11 and check 'Add python.exe to PATH', then re-run this file.\r\n"
+        "    start https://www.python.org/downloads/release/python-3119/\r\n"
+        "    pause\r\n"
+        "    exit /b 1\r\n"
+        ")\r\n"
+        "if exist \"%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\" set \"PY_CMD=%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\"\r\n"
+        "if \"%PY_CMD%\"==\"\" (\r\n"
+        "    echo Python was installed. Please CLOSE this window and double-click 1_Install_Prerequisites.bat again.\r\n"
+        "    pause\r\n"
+        "    exit /b 0\r\n"
+        ")\r\n"
+        "\r\n"
+        ":found_python\r\n"
+        "echo [OK] Python detected: %PY_CMD%\r\n"
+        "\"%PY_CMD%\" --version\r\n"
+        "echo.\r\n"
+        "echo [2/2] Installing optional Excel export helper (openpyxl)...\r\n"
+        "\"%PY_CMD%\" -m pip install --upgrade --quiet -r requirements_portable.txt\r\n"
+        "if errorlevel 1 (\r\n"
+        "    echo [NOTE] Offline or pip unavailable - app still runs 100%% offline with built-in SQLite & CSV export.\r\n"
+        ") else (\r\n"
+        "    echo [OK] Excel export library (openpyxl) is installed and ready!\r\n"
+        ")\r\n"
+        "echo.\r\n"
+        "echo ===================================================================\r\n"
+        "echo   ALL READY! Now double-click: 2_Start_WikIran_Archive.bat\r\n"
+        "echo ===================================================================\r\n"
+        "pause\r\n"
+    )
+
+    start_app_bat = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "title WikIran Archive - Portable Edition\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "set \"PY_CMD=\"\r\n"
+        "for /f \"delims=\" %%P in ('where python 2^>nul') do (\r\n"
+        "    echo %%P | findstr /I \"WindowsApps\" >nul\r\n"
+        "    if errorlevel 1 (\r\n"
+        "        set \"PY_CMD=%%P\"\r\n"
+        "        goto :run_app\r\n"
+        "    )\r\n"
+        ")\r\n"
+        "if exist \"%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\" set \"PY_CMD=%LOCALAPPDATA%\\Programs\\Python\\Python311\\python.exe\" & goto :run_app\r\n"
+        "if exist \"%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe\" set \"PY_CMD=%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe\" & goto :run_app\r\n"
+        "if exist \"%ProgramFiles%\\Python311\\python.exe\" set \"PY_CMD=%ProgramFiles%\\Python311\\python.exe\" & goto :run_app\r\n"
+        "if exist \"%ProgramFiles%\\Python312\\python.exe\" set \"PY_CMD=%ProgramFiles%\\Python312\\python.exe\" & goto :run_app\r\n"
+        "echo Python 3.11+ not found yet.\r\n"
+        "echo Please double-click 1_Install_Prerequisites.bat first!\r\n"
+        "pause\r\n"
+        "exit /b 1\r\n"
+        "\r\n"
+        ":run_app\r\n"
+        "echo Starting WikIran Archive Portable Server...\r\n"
+        "start \"WikIran Archive Server\" /MIN \"%PY_CMD%\" \"%~dp0portable_server.py\" --port 3000 --data-dir \"%~dp0.\"\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+        "set \"APP_PORT=3000\"\r\n"
+        "if exist \"%~dp0.portable_port\" set /p APP_PORT=<\"%~dp0.portable_port\"\r\n"
+        "set \"APP_URL=http://127.0.0.1:%APP_PORT%\"\r\n"
+        "echo Opening WikIran Archive at %APP_URL% ...\r\n"
+        "if exist \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" (\r\n"
+        "    start \"\" \"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=%APP_URL% --window-size=1440,920\r\n"
+        ") else if exist \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" (\r\n"
+        "    start \"\" \"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe\" --app=%APP_URL% --window-size=1440,920\r\n"
+        ") else (\r\n"
+        "    start \"\" \"%APP_URL%\"\r\n"
+        ")\r\n"
+        "exit /b 0\r\n"
+    )
+
+    stop_app_bat = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "set \"APP_PORT=3000\"\r\n"
+        "if exist \"%~dp0.portable_port\" set /p APP_PORT=<\"%~dp0.portable_port\"\r\n"
+        "echo Stopping WikIran Archive Portable Server on port %APP_PORT%...\r\n"
+        "powershell -NoProfile -Command \"try { Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:' + $env:APP_PORT + '/api/shutdown') | Out-Null; Write-Host 'Server stopped cleanly.' } catch { Write-Host 'Server is not currently running.' }\"\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+    )
+
+    shortcut_bat = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \""
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$lnk = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\\WikIran Archive (Portable).lnk'); "
+        "$lnk.TargetPath = '%~dp02_Start_WikIran_Archive.bat'; "
+        "$lnk.WorkingDirectory = '%~dp0'; "
+        "$lnk.IconLocation = 'shell32.dll,43'; "
+        "$lnk.Description = 'WikIran Archive - Portable Trade & Sanctions Screening'; "
+        "$lnk.Save(); "
+        "Write-Host 'Desktop shortcut created: WikIran Archive (Portable)'\"\r\n"
+        "pause\r\n"
+    )
+
+    readme_txt = (
+        "=====================================================================\r\n"
+        "  WIKIRAN ARCHIVE — WINDOWS 11 PORTABLE EDITION (NO SETUP.EXE!)\r\n"
+        "=====================================================================\r\n\r\n"
+        "WHY PORTABLE ZIP?\r\n"
+        "- Zero unsigned .exe files -> Zero Windows Defender / SmartScreen block.\r\n"
+        "- No installation wizard, no administrator rights needed.\r\n"
+        "- Everything (App + Python Engine + SQLite Database with OFAC,\r\n"
+        "  OpenSanctions, Front Companies & Vessels) lives inside THIS folder.\r\n"
+        "- Copy this folder onto a USB drive to run on all 5 office PCs!\r\n\r\n"
+        "QUICK START (3 SIMPLE STEPS):\r\n"
+        "  1. Extract this ZIP anywhere (e.g. C:\\WikIranArchive or Desktop).\r\n"
+        "  2. First time only: Double-click  1_Install_Prerequisites.bat\r\n"
+        "     (Verifies Python 3.11+ & installs tiny openpyxl Excel helper.)\r\n"
+        "  3. Daily launch: Double-click     2_Start_WikIran_Archive.bat\r\n"
+        "     (Starts the local server and opens the desktop app window!)\r\n\r\n"
+        "OPTIONAL:\r\n"
+        "  - Double-click Create_Desktop_Shortcut.bat to put an icon on Desktop.\r\n"
+        "  - Double-click 3_Stop_WikIran_Archive.bat to close the background server.\r\n\r\n"
+        "---------------------------------------------------------------------\r\n"
+        "راهنمای سریع فارسی (نسخه پرتابل بدون نیاز به نصب و بدون Setup.exe):\r\n"
+        "  ۱. این فایل ZIP را در هر پوشه‌ای (مثلاً C:\\WikIranArchive) از حالت فشرده خارج کنید.\r\n"
+        "  ۲. فقط بار اول روی فایل 1_Install_Prerequisites.bat دابل‌کلیک کنید.\r\n"
+        "  ۳. برای اجرای روزانه برنامه، روی 2_Start_WikIran_Archive.bat دابل‌کلیک کنید.\r\n"
+        "  * کل دیتابیس آفلاین (اوفک + OpenSanctions + شرکت‌های پوششی + کشتی‌ها + مقالات)\r\n"
+        "    داخل پوشه data همین فولدر قرار دارد و برای ۵ سیستم دیگر نیز قابل کپی است.\r\n"
+        "=====================================================================\r\n"
+    )
+
+    requirements_portable_txt = "# Lightweight dependency for Excel (.xlsx) workbook export\nopenpyxl>=3.1.5\n"
+
+    tmp_db_path: Path | None = None
+    if include_database:
+        # Create a clean, consistent online SQLite snapshot (flushes WAL safely!)
+        tmp_db_fd, tmp_db_name = tempfile.mkstemp(prefix="wikiran_portable_db_", suffix=".db")
+        import os
+        os.close(tmp_db_fd)
+        tmp_db_path = Path(tmp_db_name)
+
+    try:
+        if include_database and tmp_db_path is not None:
+            src_conn = sqlite3.connect(str(paths.db_path), timeout=30.0)
+            dst_conn = sqlite3.connect(str(tmp_db_path))
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+                src_conn.close()
+
+        portable_server_src = project_root / "wikiran_archive" / "packaging" / "portable_server.py"
+        root_folder = "WikIranArchive_Portable"
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            # Top-level .bat scripts & README (ZERO .exe files anywhere!)
+            zf.writestr(f"{root_folder}/1_Install_Prerequisites.bat", install_prereq_bat)
+            zf.writestr(f"{root_folder}/2_Start_WikIran_Archive.bat", start_app_bat)
+            zf.writestr(f"{root_folder}/3_Stop_WikIran_Archive.bat", stop_app_bat)
+            zf.writestr(f"{root_folder}/Create_Desktop_Shortcut.bat", shortcut_bat)
+            zf.writestr(f"{root_folder}/README_START_HERE.txt", readme_txt)
+            zf.writestr(f"{root_folder}/requirements_portable.txt", requirements_portable_txt)
+
+            if portable_server_src.exists():
+                zf.write(portable_server_src, f"{root_folder}/portable_server.py")
+
+            # Compiled React + Tailwind frontend (dist/)
+            if dist_dir.exists():
+                for f in dist_dir.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(project_root).as_posix()
+                        zf.write(f, f"{root_folder}/{rel}")
+
+            # Complete Python backend engine (wikiran_archive/*.py)
+            pkg_dir = project_root / "wikiran_archive"
+            if pkg_dir.exists():
+                for py_file in pkg_dir.rglob("*.py"):
+                    if "__pycache__" in py_file.parts:
+                        continue
+                    rel = py_file.relative_to(project_root).as_posix()
+                    zf.write(py_file, f"{root_folder}/{rel}")
+
+            # Documentation manuals
+            for doc_name in (
+                "OPERATOR_MANUAL_EN.md",
+                "OPERATOR_MANUAL_FA.md",
+                "ARCHITECTURE.md",
+                "DATABASE_SCHEMA.md",
+                "RECONNAISSANCE_REPORT.md",
+            ):
+                fp = project_root / doc_name
+                if fp.exists():
+                    zf.write(fp, f"{root_folder}/{doc_name}")
+
+            # Complete pre-loaded SQLite FTS5 Database (OFAC + OpenSanctions + WikIran)
+            if include_database and tmp_db_path is not None and tmp_db_path.exists():
+                zf.write(tmp_db_path, f"{root_folder}/data/wikiran_archive.db")
+            else:
+                zf.writestr(f"{root_folder}/data/.keep", "")
+
+            # Ensure empty portable folders exist inside the zip
+            for empty_dir in ("backups", "exports", "logs"):
+                zf.writestr(f"{root_folder}/{empty_dir}/.keep", "")
+    finally:
+        if tmp_db_path is not None:
+            tmp_db_path.unlink(missing_ok=True)
+
+    return zip_path
+
+
+def build_windows_portable_lite_zip(
+    project_root: Path, paths: AppPaths, repo: ArchiveRepository
+) -> Path:
+    """Build the ~1 MB instant-download Portable Windows Release ZIP (app + engine + .bat launchers)."""
+    return build_windows_portable_zip(project_root, paths, repo, include_database=False)
+
+
+

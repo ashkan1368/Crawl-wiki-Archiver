@@ -465,6 +465,71 @@ class ArchiveExporter:
                     )
                 return (sheet_title, ofac_headers, formatted_rows)
 
+            def _build_opensanctions_sheet(scope: str) -> tuple[str, list[str], list[list[Any]]]:
+                os_headers = [
+                    "OpenSanctions ID",
+                    "Schema / Type",
+                    "Primary Name",
+                    "Aliases",
+                    "Countries",
+                    "Birth Date",
+                    "Identifiers (IMO / Passport / Reg)",
+                    "Addresses",
+                    "Sanctions Programs",
+                    "Source Lists (UN/EU/UK/US/etc.)",
+                    "Sanctions Details",
+                    "Last Changed",
+                    "OpenSanctions URL",
+                ]
+                if scope == "opensanctions_iran":
+                    rows_db = self.repo.conn.execute(
+                        """
+                        SELECT os_id, schema_type, name, aliases, countries, birth_date,
+                               identifiers, addresses, program_ids, datasets, sanctions,
+                               last_change, source_url
+                        FROM opensanctions_entities
+                        WHERE (';' || LOWER(countries) || ';') LIKE '%;ir;%'
+                           OR UPPER(program_ids) LIKE '%IRAN%'
+                           OR UPPER(sanctions) LIKE '%IRAN%'
+                           OR UPPER(sanctions) LIKE '%IRGC%'
+                           OR UPPER(datasets) LIKE '%IRAN%'
+                        ORDER BY name ASC;
+                        """
+                    ).fetchall()
+                    sheet_title = "OpenSanctions Iran"
+                else:
+                    rows_db = self.repo.conn.execute(
+                        """
+                        SELECT os_id, schema_type, name, aliases, countries, birth_date,
+                               identifiers, addresses, program_ids, datasets, sanctions,
+                               last_change, source_url
+                        FROM opensanctions_entities
+                        ORDER BY name ASC
+                        LIMIT 100000;
+                        """
+                    ).fetchall()
+                    sheet_title = "OpenSanctions Global"
+
+                formatted_rows = [
+                    [
+                        r["os_id"],
+                        r["schema_type"],
+                        r["name"],
+                        r["aliases"],
+                        r["countries"],
+                        r["birth_date"],
+                        r["identifiers"],
+                        r["addresses"],
+                        r["program_ids"],
+                        r["datasets"],
+                        r["sanctions"],
+                        r["last_change"],
+                        r["source_url"],
+                    ]
+                    for r in rows_db
+                ]
+                return (sheet_title, os_headers, formatted_rows)
+
             entity_map: dict[str, tuple[str, list[str], list[list[Any]]]] = {
                 "articles": art_sheet,
                 "publications": pub_sheet,
@@ -478,6 +543,10 @@ class ArchiveExporter:
                 entity_map["ofac_iran"] = _build_ofac_sheet("ofac_iran")
             if "ofac_all" in requested_keys:
                 entity_map["ofac_all"] = _build_ofac_sheet("ofac_all")
+            if "opensanctions_iran" in requested_keys:
+                entity_map["opensanctions_iran"] = _build_opensanctions_sheet("opensanctions_iran")
+            if "opensanctions_all" in requested_keys:
+                entity_map["opensanctions_all"] = _build_opensanctions_sheet("opensanctions_all")
 
             selected_sheets = [
                 entity_map[key] for key in requested_keys if key in entity_map

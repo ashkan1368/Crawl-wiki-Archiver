@@ -93,6 +93,7 @@ def extract_article_from_html(
     pub_id = parsed_path.rstrip("/").split("/")[-1] or "unknown-article"
     is_email_doc = "/document/emails/" in canonical_url
     is_file_doc = "/document/files/" in canonical_url
+    is_csv_doc = "/document/csv/" in canonical_url
 
     # Extract Headline
     m_head = re.search(
@@ -128,6 +129,8 @@ def extract_article_from_html(
         subtitle = "WikIran Extracted Email Correspondence"
     elif is_file_doc:
         subtitle = "WikIran Extracted Document File"
+    elif is_csv_doc:
+        subtitle = "WikIran Extracted CSV Archive Record"
     else:
         subtitle = "WikIran Public Investigation"
 

@@ -19,8 +19,16 @@ from typing import Any
 from .backup.manager import BackupManager
 from .collector.engine import CollectionEngine
 from .collector.ofac_sync import get_ofac_summary, sync_ofac_lists
+from .collector.opensanctions_sync import get_opensanctions_summary, sync_opensanctions_dataset
 from .collector.reconnaissance import generate_reconnaissance_markdown, run_reconnaissance
 from .collector.scheduler import ScheduledCollectionRunner
+from .collector.wikiran_live import (
+    download_targeted_leaks,
+    get_leak_collections_catalog,
+    get_wikiran_documents_summary,
+    search_wikiran_live,
+    sync_wikiran_structured_archives,
+)
 from .config.settings import AppPaths, resolve_app_paths
 from .database.connection import get_connection, verify_database_integrity
 from .database.migrations import run_migrations
@@ -29,6 +37,11 @@ from .database.seed import seed_verified_public_archive
 from .export.csv_converter import CsvSpreadsheetWorkbench
 from .export.exporters import ArchiveExporter
 from .logging_utils.logger import friendly_clerk_message, read_diagnostic_logs, setup_logger
+from .search.batch_screener import (
+    generate_watchlist_template_csv,
+    generate_watchlist_template_xlsx,
+    run_batch_watchlist_screening,
+)
 from .search.fts_search import ArchiveSearchEngine, SearchFilters
 from .ui.main_window import DesktopController, launch_pyside6_gui
 
@@ -145,6 +158,18 @@ def compute_storage_volume(paths: AppPaths, repo: ArchiveRepository) -> dict[str
     except Exception:
         ofac_entities_count = 0
     try:
+        opensanctions_count = int(
+            repo.conn.execute("SELECT COUNT(*) FROM opensanctions_entities;").fetchone()[0]
+        )
+    except Exception:
+        opensanctions_count = 0
+    try:
+        wikiran_docs_count = int(
+            repo.conn.execute("SELECT COUNT(*) FROM wikiran_documents;").fetchone()[0]
+        )
+    except Exception:
+        wikiran_docs_count = 0
+    try:
         text_bytes = int(
             repo.conn.execute(
                 """
@@ -153,6 +178,8 @@ def compute_storage_volume(paths: AppPaths, repo: ArchiveRepository) -> dict[str
                   + COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(description AS BLOB))) FROM publications), 0)
                   + COALESCE((SELECT SUM(LENGTH(CAST(searchable_text AS BLOB))) FROM imported_csv_rows), 0)
                   + COALESCE((SELECT SUM(LENGTH(CAST(sdn_name AS BLOB)) + LENGTH(CAST(aliases_text AS BLOB)) + LENGTH(CAST(addresses_text AS BLOB)) + LENGTH(CAST(remarks AS BLOB))) FROM ofac_entities), 0)
+                  + COALESCE((SELECT SUM(LENGTH(CAST(name AS BLOB)) + LENGTH(CAST(aliases AS BLOB)) + LENGTH(CAST(addresses AS BLOB)) + LENGTH(CAST(sanctions AS BLOB))) FROM opensanctions_entities), 0)
+                  + COALESCE((SELECT SUM(LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(snippet AS BLOB))) FROM wikiran_documents), 0)
                 """
             ).fetchone()[0]
         )
@@ -167,6 +194,8 @@ def compute_storage_volume(paths: AppPaths, repo: ArchiveRepository) -> dict[str
         + stats["file_inventory_count"]
         + csv_rows_count
         + ofac_entities_count
+        + opensanctions_count
+        + wikiran_docs_count
     )
 
     return {
@@ -184,6 +213,8 @@ def compute_storage_volume(paths: AppPaths, repo: ArchiveRepository) -> dict[str
         "publications_count": stats["publications_count"],
         "csv_rows_count": csv_rows_count,
         "ofac_entities_count": ofac_entities_count,
+        "opensanctions_count": opensanctions_count,
+        "wikiran_docs_count": wikiran_docs_count,
         "fts_indexed_count": fts_indexed_count,
     }
 
@@ -223,6 +254,9 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
                 "paths": _resolve_configured_paths_dict(paths, repo),
                 "storage_volume": compute_storage_volume(paths, repo),
                 "ofac_summary": get_ofac_summary(repo.conn, repo.get_settings()),
+                "opensanctions_summary": get_opensanctions_summary(repo.conn, repo.get_settings()),
+                "wikiran_docs_summary": get_wikiran_documents_summary(repo.conn, repo.get_settings()),
+                "frontier_stats": CollectionEngine(repo).get_frontier_stats(),
             }
 
         if action == "csv_import":
@@ -278,17 +312,75 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
             }
 
         if action == "search":
+            raw_query = str(payload.get("query", "") or "").strip()
+            req_source_type = payload.get("source_type") or None
+            include_live = bool(payload.get("include_live_wikiran", True))
+            leak_source_filter = str(payload.get("leak_source") or "").strip() or None
+            live_pages = int(payload.get("live_pages", 2))
+
             filters = SearchFilters(
-                query=payload.get("query", ""),
+                query=raw_query,
                 date_from=payload.get("date_from") or None,
                 date_to=payload.get("date_to") or None,
                 category_slug=payload.get("category_slug") or None,
                 organization_name=payload.get("organization_name") or None,
-                source_type=payload.get("source_type") or None,
+                source_type=req_source_type,
                 extraction_status=payload.get("extraction_status") or None,
             )
             engine = ArchiveSearchEngine(repo.conn)
-            return {"ok": True, "results": engine.search(filters)}
+            local_results = engine.search(filters)
+
+            wikiran_live_meta: dict[str, Any] | None = None
+            should_run_live = (
+                include_live
+                and bool(raw_query)
+                and req_source_type in (None, "", "ALL", "WIKIRAN_DOC", "WIKIRAN_LIVE")
+            )
+            merged_results = list(local_results)
+            if should_run_live:
+                live_resp = search_wikiran_live(
+                    repo,
+                    raw_query,
+                    max_pages=live_pages,
+                    tab_type="all",
+                    leak_source=leak_source_filter,
+                    auto_cache=True,
+                )
+                wikiran_live_meta = {
+                    "online": live_resp.get("online", False),
+                    "total_label": live_resp.get("total_label", ""),
+                    "total_int": live_resp.get("total_int", 0),
+                    "facets": live_resp.get("facets", []),
+                    "fetched_count": live_resp.get("fetched_count", 0),
+                    "cached_new_count": live_resp.get("cached_new_count", 0),
+                    "search_url": live_resp.get("search_url", ""),
+                    "error": live_resp.get("error", ""),
+                }
+                existing_urls = {
+                    str(r.get("source_url") or "").rstrip("/") for r in merged_results
+                }
+                live_new_items = [
+                    item
+                    for item in live_resp.get("results", [])
+                    if str(item.get("source_url") or "").rstrip("/") not in existing_urls
+                ]
+                # Insert live WikIran hits right after OFAC/OpenSanctions matches so they're immediately visible!
+                sanction_items = [
+                    r for r in merged_results if r.get("record_type") in ("OFAC_SANCTION", "OPENSANCTIONS")
+                ]
+                other_local_items = [
+                    r for r in merged_results if r.get("record_type") not in ("OFAC_SANCTION", "OPENSANCTIONS")
+                ]
+                if req_source_type == "WIKIRAN_LIVE":
+                    merged_results = live_resp.get("results", [])
+                else:
+                    merged_results = sanction_items + live_new_items + other_local_items
+
+            return {
+                "ok": True,
+                "results": merged_results,
+                "wikiran_live": wikiran_live_meta,
+            }
 
         if action == "set_settings":
             updates: dict[str, str] = payload.get("settings", {})
@@ -307,18 +399,33 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
 
         if action == "update_archive":
             engine = CollectionEngine(repo)
+            mode = str(payload.get("mode", "")).strip().lower()
             simulate_interrupt = payload.get("simulate_interrupt_after")
-            max_items_val = int(payload.get("max_items", 12))
+            max_items_val = int(payload.get("max_items", 25))
             deep_spider_val = bool(payload.get("deep_spider", True))
-            summary = engine.run_incremental_update(
-                max_items=max_items_val,
-                simulate_interrupt_after=int(simulate_interrupt) if simulate_interrupt is not None else None,
-                deep_spider=deep_spider_val,
-            )
+
+            if mode == "discover":
+                summary = engine.run_discovery(
+                    max_pages_per_hub=int(payload.get("max_pages_per_hub", 8))
+                )
+            elif mode == "deep_spider":
+                summary = engine.run_deep_spider(max_items=max_items_val)
+            elif mode == "check_updates":
+                summary = engine.run_update_check(max_recheck=max(10, max_items_val))
+            else:
+                summary = engine.run_incremental_update(
+                    max_items=max_items_val,
+                    simulate_interrupt_after=int(simulate_interrupt) if simulate_interrupt is not None else None,
+                    deep_spider=deep_spider_val,
+                )
+
             ArchiveSearchEngine(repo.conn)._ensure_views_and_fts_synced()
             return {
                 "ok": True,
+                "mode": mode or "incremental",
                 "job": summary,
+                "frontier_stats": engine.get_frontier_stats(),
+                "storage_volume": compute_storage_volume(paths, repo),
                 "stats": repo.get_dashboard_stats(),
                 "trends": repo.get_collection_trends(),
                 "jobs": repo.list_collection_jobs(),
@@ -338,6 +445,7 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
                 "articles_count": stats["articles_count"],
                 "publications_count": stats["publications_count"],
                 "stop_requested": stop_flag,
+                "frontier_stats": CollectionEngine(repo).get_frontier_stats(),
                 "storage_volume": compute_storage_volume(paths, repo),
             }
 
@@ -360,6 +468,99 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
             return {
                 **result,
                 "storage_volume": compute_storage_volume(paths, repo),
+                "jobs": repo.list_collection_jobs(),
+                "history": repo.list_collection_history(limit=60),
+            }
+
+        if action == "opensanctions_status":
+            return {
+                "ok": True,
+                "summary": get_opensanctions_summary(repo.conn, repo.get_settings()),
+                "storage_volume": compute_storage_volume(paths, repo),
+            }
+
+        if action == "opensanctions_sync":
+            dataset_name = str(payload.get("dataset", "sanctions")).strip() or "sanctions"
+            force_flag = bool(payload.get("force", False))
+            check_only_flag = bool(payload.get("check_only", False))
+            result = sync_opensanctions_dataset(
+                repo,
+                dataset_name=dataset_name,
+                force=force_flag,
+                check_only=check_only_flag,
+                exports_dir=paths.exports_dir,
+            )
+            return {
+                **result,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "jobs": repo.list_collection_jobs(),
+                "history": repo.list_collection_history(limit=60),
+            }
+
+        if action == "wikiran_sync_archives":
+            target_slug = str(payload.get("target", "both")).strip() or "both"
+            result = sync_wikiran_structured_archives(repo, target=target_slug)
+            return {
+                **result,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "wikiran_docs_summary": get_wikiran_documents_summary(repo.conn, repo.get_settings()),
+                "jobs": repo.list_collection_jobs(),
+                "history": repo.list_collection_history(limit=60),
+            }
+
+        if action == "watchlist_template":
+            fmt = str(payload.get("format", "xlsx")).strip().lower()
+            out_path = (
+                generate_watchlist_template_csv(paths.exports_dir)
+                if fmt == "csv"
+                else generate_watchlist_template_xlsx(paths.exports_dir)
+            )
+            return {
+                "ok": True,
+                "path": str(out_path),
+                "filename": out_path.name,
+            }
+
+        if action == "watchlist_screen":
+            result = run_batch_watchlist_screening(
+                repo,
+                paths.exports_dir,
+                file_b64=payload.get("file_b64") or None,
+                filename=str(payload.get("filename") or ""),
+                raw_text=payload.get("raw_text"),
+                include_live_wikiran=bool(payload.get("include_live_wikiran", True)),
+                max_live_queries=int(payload.get("max_live_queries", 80)),
+            )
+            return {
+                **result,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "wikiran_docs_summary": get_wikiran_documents_summary(repo.conn, repo.get_settings()),
+            }
+
+        if action == "leaks_catalog":
+            refresh_flag = bool(payload.get("refresh", False))
+            catalog = get_leak_collections_catalog(repo, refresh_remote=refresh_flag)
+            return {
+                **catalog,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "wikiran_docs_summary": get_wikiran_documents_summary(repo.conn, repo.get_settings()),
+            }
+
+        if action == "leaks_download":
+            slugs_val = payload.get("slugs") or []
+            if isinstance(slugs_val, str):
+                slugs_val = [s.strip() for s in slugs_val.split(",") if s.strip()]
+            result = download_targeted_leaks(
+                repo,
+                list(slugs_val),
+                max_pages_per_leak=int(payload.get("max_pages_per_leak", 10)),
+                keyword=str(payload.get("keyword") or ""),
+                start_from_page_1=bool(payload.get("start_from_page_1", False)),
+            )
+            return {
+                **result,
+                "storage_volume": compute_storage_volume(paths, repo),
+                "wikiran_docs_summary": get_wikiran_documents_summary(repo.conn, repo.get_settings()),
                 "jobs": repo.list_collection_jobs(),
                 "history": repo.list_collection_history(limit=60),
             }
@@ -419,21 +620,77 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
                 "backups": backup_mgr.list_backups(),
             }
 
+        if action == "backup_full_create":
+            backup_mgr = BackupManager(paths.db_path, paths.backups_dir)
+            info = backup_mgr.create_full_portable_backup(exports_dir=paths.exports_dir)
+            return {
+                "ok": True,
+                "clerk_message": friendly_clerk_message("BACKUP_SUCCESS", lang),
+                "backup": info,
+                "backups": backup_mgr.list_backups(),
+                "storage_volume": compute_storage_volume(paths, repo),
+            }
+
         if action == "backup_restore":
             backup_mgr = BackupManager(paths.db_path, paths.backups_dir)
-            backup_path = payload.get("path")
+            backup_path = str(payload.get("path") or "")
             confirmed = bool(payload.get("confirmed", False))
-            res = backup_mgr.restore_backup(backup_path, confirmed=confirmed)
+            if backup_path.lower().endswith(".zip"):
+                res = backup_mgr.restore_full_portable_backup(
+                    backup_path, exports_dir=paths.exports_dir, confirmed=confirmed
+                )
+            else:
+                res = backup_mgr.restore_backup(backup_path, confirmed=confirmed)
             return {
                 "ok": True,
                 "clerk_message": friendly_clerk_message("BACKUP_RESTORE_SUCCESS", lang),
                 "restore": res,
                 "backups": backup_mgr.list_backups(),
+                "storage_volume": compute_storage_volume(paths, repo),
+            }
+
+        if action == "backup_full_restore":
+            backup_mgr = BackupManager(paths.db_path, paths.backups_dir)
+            backup_path = str(payload.get("path") or "")
+            confirmed = bool(payload.get("confirmed", False))
+            res = backup_mgr.restore_full_portable_backup(
+                backup_path, exports_dir=paths.exports_dir, confirmed=confirmed
+            )
+            return {
+                "ok": True,
+                "clerk_message": friendly_clerk_message("BACKUP_RESTORE_SUCCESS", lang),
+                "restore": res,
+                "backups": backup_mgr.list_backups(),
+                "storage_volume": compute_storage_volume(paths, repo),
             }
 
         if action == "integrity_check":
             ok, msg = verify_database_integrity(paths.db_path)
             return {"ok": True, "verified": ok, "message": msg}
+
+        if action == "windows_portable_zip":
+            from .packaging.windows_bundle import build_windows_portable_zip
+
+            project_root = Path(__file__).resolve().parent.parent
+            zip_path = build_windows_portable_zip(project_root, paths, repo, include_database=True)
+            return {
+                "ok": True,
+                "path": str(zip_path),
+                "filename": zip_path.name,
+                "size_bytes": zip_path.stat().st_size,
+            }
+
+        if action == "windows_portable_lite_zip":
+            from .packaging.windows_bundle import build_windows_portable_lite_zip
+
+            project_root = Path(__file__).resolve().parent.parent
+            zip_path = build_windows_portable_lite_zip(project_root, paths, repo)
+            return {
+                "ok": True,
+                "path": str(zip_path),
+                "filename": zip_path.name,
+                "size_bytes": zip_path.stat().st_size,
+            }
 
         if action == "windows_package":
             from .packaging.windows_bundle import build_windows11_clerk_zip
@@ -483,11 +740,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recon", action="store_true", help="Run website reconnaissance")
     parser.add_argument("--api", type=str, help="Execute JSON API action for local bridge")
     parser.add_argument("--payload", type=str, default="{}", help="JSON payload for --api")
+    parser.add_argument("--payload-file", type=str, default=None, help="Path to JSON payload file for --api")
     parser.add_argument("--data-dir", type=str, default=None, help="Custom data directory override")
     args = parser.parse_args(argv)
 
     if args.api:
-        result = handle_api_command(args.api, args.payload, args.data_dir)
+        raw_payload = args.payload
+        if args.payload_file:
+            raw_payload = Path(args.payload_file).read_text(encoding="utf-8")
+        result = handle_api_command(args.api, raw_payload, args.data_dir)
         print(json.dumps(result, ensure_ascii=False))
         return 0
 

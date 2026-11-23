@@ -19,3 +19,82 @@
     font-variant-numeric: tabular-nums;
   }
 }
+
+/* Active Spider Radar & Live Crawl Visual Animations */
+@keyframes spider-radar-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes spider-pulse-ring {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(1.22);
+    opacity: 0.12;
+  }
+  100% {
+    transform: scale(1.3);
+    opacity: 0;
+  }
+}
+
+@keyframes spider-node-blink {
+  0%, 100% {
+    opacity: 0.25;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+}
+
+@keyframes spider-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+.animate-spider-radar {
+  transform-origin: center;
+  animation: spider-radar-spin 2.4s linear infinite;
+}
+
+.animate-spider-pulse-1 {
+  transform-origin: center;
+  animation: spider-pulse-ring 2.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+.animate-spider-pulse-2 {
+  transform-origin: center;
+  animation: spider-pulse-ring 2.2s cubic-bezier(0.22, 1, 0.36, 1) 1.1s infinite;
+}
+
+.animate-spider-node-a {
+  transform-origin: center;
+  animation: spider-node-blink 1.5s ease-in-out infinite;
+}
+
+.animate-spider-node-b {
+  transform-origin: center;
+  animation: spider-node-blink 1.5s ease-in-out 0.5s infinite;
+}
+
+.animate-spider-node-c {
+  transform-origin: center;
+  animation: spider-node-blink 1.5s ease-in-out 1.0s infinite;
+}
+
+.animate-spider-shimmer {
+  animation: spider-shimmer 1.8s ease-in-out infinite;
+}

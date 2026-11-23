@@ -37,6 +37,7 @@ import {
   HardDrive,
   ChevronDown,
   ChevronRight,
+  ClipboardList,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -51,6 +52,8 @@ import {
   Legend,
 } from 'recharts';
 import { Language, NavSection, UI_LABELS } from './i18n';
+import { BatchWatchlistPanel } from './components/BatchWatchlistPanel';
+import { TargetedLeakDownloaderPanel } from './components/TargetedLeakDownloaderPanel';
 
 interface Article {
   id: number;
@@ -260,6 +263,8 @@ interface OverviewPayload {
     publications_count: number;
     csv_rows_count: number;
     ofac_entities_count?: number;
+    opensanctions_count?: number;
+    wikiran_docs_count?: number;
     fts_indexed_count: number;
   };
   ofac_summary?: {
@@ -278,6 +283,35 @@ interface OverviewPayload {
     sanctions_programs_count: number;
     top_programs: Array<{ program: string; count: number }>;
     sample_iran_entities: Array<Record<string, unknown>>;
+  };
+  opensanctions_summary?: {
+    total_entities: number;
+    iran_related_count: number;
+    dataset_name: string;
+    last_change: string;
+    last_sync_at: string;
+    last_check_at: string;
+    catalog_datasets_count: number;
+    source_datasets_count: number;
+    schema_counts: Array<{ schema: string; count: number }>;
+    top_source_lists: Array<{ list: string; count: number }>;
+    sample_iran_entities: Array<Record<string, unknown>>;
+  };
+  wikiran_docs_summary?: {
+    total: number;
+    front_companies: number;
+    vessels: number;
+    leaked_emails: number;
+    leaked_files: number;
+    other_docs: number;
+    last_sync_at: string;
+  };
+  frontier_stats?: {
+    pending: number;
+    crawled: number;
+    failed: number;
+    blocked: number;
+    total: number;
   };
 }
 
@@ -340,10 +374,19 @@ export default function App() {
   const [csvCrossDatasetAudit, setCsvCrossDatasetAudit] = useState<boolean>(false);
   const [activeCsvView, setActiveCsvView] = useState<ActiveCsvPayload | null>(null);
 
-  // Export Report Wizard state: allows user to choose specific data entities (OFAC + WikIran) & optional date range
+  // Export Report Wizard state: allows user to choose specific data entities (OFAC + OpenSanctions + WikIran) & optional date range
   const [wizardEntities, setWizardEntities] = useState<
-    Array<'ofac_iran' | 'ofac_all' | 'articles' | 'publications' | 'organizations' | 'tags'>
-  >(['ofac_iran', 'articles', 'publications']);
+    Array<
+      | 'ofac_iran'
+      | 'ofac_all'
+      | 'opensanctions_iran'
+      | 'opensanctions_all'
+      | 'articles'
+      | 'publications'
+      | 'organizations'
+      | 'tags'
+    >
+  >(['ofac_iran', 'opensanctions_iran', 'articles', 'publications']);
   const [wizardDateFrom, setWizardDateFrom] = useState<string>('');
   const [wizardDateTo, setWizardDateTo] = useState<string>('');
 
@@ -363,19 +406,124 @@ export default function App() {
     articles_count: number;
     publications_count: number;
     stop_requested: boolean;
+    frontier_stats?: OverviewPayload['frontier_stats'];
     storage_volume?: OverviewPayload['storage_volume'];
   } | null>(null);
 
-  // Quick source-scope tab inside Universal Search results (All vs OFAC Sanctions vs WikIran Archive)
-  const [searchScopeTab, setSearchScopeTab] = useState<'ALL' | 'OFAC' | 'WIKIRAN'>('ALL');
+  // Quick source-scope tab inside Universal Search results (All vs OFAC vs OpenSanctions vs WikIran)
+  const [searchScopeTab, setSearchScopeTab] = useState<'ALL' | 'OFAC' | 'OPENSANCTIONS' | 'WIKIRAN'>('ALL');
+  const [includeLiveWikIran, setIncludeLiveWikIran] = useState<boolean>(true);
+  const [activeLeakSourceFilter, setActiveLeakSourceFilter] = useState<string>('');
+  const [wikiranLiveMeta, setWikiranLiveMeta] = useState<{
+    online: boolean;
+    total_label: string;
+    total_int: number;
+    facets: Array<{ source: string; label: string; amount: number }>;
+    fetched_count: number;
+    cached_new_count: number;
+    search_url: string;
+    error?: string;
+  } | null>(null);
+  const [wikiranSyncNote, setWikiranSyncNote] = useState<string | null>(null);
   const [ofacStatusNote, setOfacStatusNote] = useState<string | null>(null);
+  const [osStatusNote, setOsStatusNote] = useState<string | null>(null);
+  const [fullBackupMsg, setFullBackupMsg] = useState<string | null>(null);
 
   const toggleWizardEntity = (
-    entity: 'ofac_iran' | 'ofac_all' | 'articles' | 'publications' | 'organizations' | 'tags'
+    entity:
+      | 'ofac_iran'
+      | 'ofac_all'
+      | 'opensanctions_iran'
+      | 'opensanctions_all'
+      | 'articles'
+      | 'publications'
+      | 'organizations'
+      | 'tags'
   ) => {
     setWizardEntities((prev) =>
       prev.includes(entity) ? prev.filter((item) => item !== entity) : [...prev, entity]
     );
+  };
+
+  const [chunkDownloadProgress, setChunkDownloadProgress] = useState<{
+    label: string;
+    percent: number;
+    loadedMb: string;
+    totalMb: string;
+  } | null>(null);
+
+  const downloadChunkedZip = async (
+    prepareUrl: string,
+    chunkUrl: string,
+    prepareBody: Record<string, unknown>,
+    displayLabel: string
+  ) => {
+    setChunkDownloadProgress({
+      label: displayLabel,
+      percent: 2,
+      loadedMb: '0.0',
+      totalMb: '...',
+    });
+    setFullBackupMsg(null);
+    try {
+      const prepRes = await fetch(prepareUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prepareBody),
+      });
+      const prep = await prepRes.json();
+      if (!prep.ok || !prep.size_bytes) {
+        throw new Error(prep.error || 'Could not prepare ZIP package on server.');
+      }
+
+      const totalBytes = Number(prep.size_bytes);
+      const chunkSize = Number(prep.chunk_size || 8 * 1024 * 1024);
+      const filename = String(prep.filename || 'WikIranArchive_Portable_Windows.zip');
+      const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
+      const chunks: BlobPart[] = [];
+      let loaded = 0;
+
+      while (loaded < totalBytes) {
+        const len = Math.min(chunkSize, totalBytes - loaded);
+        const cRes = await fetch(`${chunkUrl}?offset=${loaded}&length=${len}`);
+        if (!cRes.ok) {
+          throw new Error(`Chunk download failed at byte ${loaded} (HTTP ${cRes.status})`);
+        }
+        const buf = await cRes.arrayBuffer();
+        chunks.push(buf);
+        loaded += buf.byteLength;
+        const pct = Math.min(99, Math.round((loaded / totalBytes) * 100));
+        setChunkDownloadProgress({
+          label: `${displayLabel} — ${filename}`,
+          percent: pct,
+          loadedMb: (loaded / (1024 * 1024)).toFixed(1),
+          totalMb,
+        });
+      }
+
+      const blob = new Blob(chunks, { type: 'application/zip' });
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      setFullBackupMsg(
+        lang === 'fa'
+          ? `فایل ${filename} (${totalMb} MB) با موفقیت آماده و دانلود شد.`
+          : `Downloaded ${filename} (${totalMb} MB) successfully.`
+      );
+    } catch (err) {
+      setFullBackupMsg(
+        lang === 'fa'
+          ? `خطا در دانلود بسته: ${String(err)}`
+          : `Download error: ${String(err)}`
+      );
+    } finally {
+      setChunkDownloadProgress(null);
+    }
   };
 
   // Helper to highlight search query terms with a bold yellow background inside summaries and excerpts
@@ -702,9 +850,62 @@ export default function App() {
     }
   };
 
+  const handleSyncWikIranArchives = async (target: 'both' | 'front-companies' | 'vessels' = 'both') => {
+    if (isOffline) {
+      setBannerMessage({
+        text:
+          lang === 'fa'
+            ? 'آفلاین: برای همگام‌سازی آرشیو شرکت‌های پوششی و کشتی‌های ویکی‌ایران نیاز به اینترنت است.'
+            : 'Offline Mode: Internet is required to download Front Companies & Vessels from WikIran.org.',
+        type: 'error',
+      });
+      return;
+    }
+    setBusyAction(`wikiran_sync_${target}`);
+    setWikiranSyncNote(null);
+    setBannerMessage(null);
+    try {
+      const res = await fetch('/api/wikiran/sync-archives', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+      });
+      const json = await res.json();
+      await fetchOverview();
+      if (json.ok) {
+        const fc = Number(json.summary?.front_companies || 0);
+        const vs = Number(json.summary?.vessels || 0);
+        const added = Number(json.newly_added || 0);
+        const msg =
+          lang === 'fa'
+            ? `همگام‌سازی کامل شد: ${fc.toLocaleString()} شرکت پوششی (Front Companies) و ${vs.toLocaleString()} کشتی (Vessels) اکنون به‌صورت ۱۰۰٪ آفلاین در جستجوی محلی ذخیره شدند (+${added.toLocaleString()} رکورد جدید).`
+            : `Offline sync complete: ${fc.toLocaleString()} Front Companies & ${vs.toLocaleString()} Vessels are now indexed 100% offline in local SQLite FTS5 (+${added.toLocaleString()} newly added).`;
+        setWikiranSyncNote(msg);
+        setBannerMessage({ text: msg, type: 'info' });
+      } else {
+        setBannerMessage({
+          text: json.error || 'WikIran structured archive sync failed.',
+          type: 'error',
+        });
+      }
+    } catch (err) {
+      setBannerMessage({ text: `WikIran sync error: ${String(err)}`, type: 'error' });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const runUniversalSearchWithQuery = async (
     q: string,
-    opts?: { category?: string; org?: string; type?: string; from?: string; to?: string }
+    opts?: {
+      category?: string;
+      org?: string;
+      type?: string;
+      from?: string;
+      to?: string;
+      includeLive?: boolean;
+      leakSource?: string;
+    }
   ) => {
     setBusyAction('search');
     const targetCategory = opts?.category ?? filterCategory;
@@ -712,6 +913,8 @@ export default function App() {
     const targetType = opts?.type ?? filterType;
     const targetFrom = opts?.from ?? filterDateFrom;
     const targetTo = opts?.to ?? filterDateTo;
+    const targetLive = (opts?.includeLive ?? includeLiveWikIran) && !isOffline;
+    const targetLeakSource = opts?.leakSource !== undefined ? opts.leakSource : activeLeakSourceFilter;
 
     try {
       const res = await fetch('/api/search', {
@@ -724,11 +927,15 @@ export default function App() {
           source_type: targetType === 'ALL' ? null : targetType,
           date_from: targetFrom || null,
           date_to: targetTo || null,
+          include_live_wikiran: targetLive,
+          leak_source: targetLeakSource || null,
+          live_pages: 2,
         }),
       });
       const json = await res.json();
       if (json.ok) {
         setSearchResults(json.results);
+        setWikiranLiveMeta(json.wikiran_live || null);
       }
     } catch {
       // Offline fallback over cached local SQLite records if browser network is completely severed
@@ -864,10 +1071,93 @@ export default function App() {
     }
   };
 
+  const handleOpenSanctionsSync = async (
+    opts: { force?: boolean; check_only?: boolean; dataset?: string } = {}
+  ) => {
+    if (isOffline) {
+      setBannerMessage({
+        text:
+          lang === 'fa'
+            ? 'آفلاین: برای بررسی و دانلود OpenSanctions اینترنت لازم است، اما جستجوی آفلاین در رکوردهای ذخیره‌شده فعال است.'
+            : 'Offline Mode: Internet is needed to check OpenSanctions index.json for updates, while local offline screening remains 100% active.',
+        type: 'error',
+      });
+      return;
+    }
+    setBusyAction(opts.check_only ? 'os_check' : 'os_sync');
+    setOsStatusNote(null);
+    try {
+      const res = await fetch('/api/opensanctions/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataset: 'sanctions', ...opts }),
+      });
+      const json = await res.json();
+      if (json.ok) {
+        const msg =
+          json.message ||
+          (lang === 'fa'
+            ? `همگام‌سازی OpenSanctions با موفقیت انجام شد (${Number(json.summary?.total_entities || 0).toLocaleString()} رکورد).`
+            : `OpenSanctions synced (${Number(json.summary?.total_entities || 0).toLocaleString()} global targets offline).`);
+        setOsStatusNote(msg);
+        setBannerMessage({ text: msg, type: 'info' });
+        await fetchOverview();
+      } else {
+        setBannerMessage({
+          text: json.error || 'OpenSanctions sync failed.',
+          type: 'error',
+        });
+      }
+    } catch (err) {
+      setBannerMessage({ text: `OpenSanctions sync error: ${String(err)}`, type: 'error' });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleFullBackupRestoreUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setBusyAction('full_restore');
+    setFullBackupMsg(null);
+    try {
+      const res = await fetch('/api/backup/full-restore-upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Backup-Filename': file.name,
+        },
+        body: file,
+      });
+      const json = await res.json();
+      if (json.ok) {
+        const rawRestored = Number(json.restore?.restored_raw_files || 0);
+        const msg =
+          lang === 'fa'
+            ? `بازیابی کامل بکاپ (${file.name}) با موفقیت انجام شد! کل دیتابیس (ویکی‌ایران + اوفک + OpenSanctions) و ${rawRestored} فایل خام بدون نیاز به دانلود مجدد بازیابی شدند.`
+            : `Full Portable Backup (${file.name}) restored cleanly! Complete database (WikIran + OFAC + OpenSanctions) and ${rawRestored} raw dataset files are now active offline.`;
+        setFullBackupMsg(msg);
+        setBannerMessage({ text: msg, type: 'info' });
+        await fetchOverview();
+      } else {
+        setBannerMessage({
+          text: json.error || 'Could not restore uploaded backup file.',
+          type: 'error',
+        });
+      }
+    } catch (err) {
+      setBannerMessage({ text: `Restore upload error: ${String(err)}`, type: 'error' });
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleUpdateArchive = async (
     simulateInterruptAfter?: number,
-    maxItems: number = 12,
-    deepSpider: boolean = true
+    maxItems: number = 25,
+    deepSpider: boolean = true,
+    mode: 'discover' | 'deep_spider' | 'check_updates' | 'incremental' = 'incremental'
   ) => {
     if (isOffline) {
       setBannerMessage({
@@ -879,15 +1169,24 @@ export default function App() {
       });
       return;
     }
-    setCrawlModeLabel(
-      maxItems === 0
+    const modeTitle =
+      mode === 'discover'
         ? lang === 'fa'
-          ? 'خزش عنکبوتی کامل (تمام صفحات تا صفحه آخر)'
-          : 'Deep Spider Crawl (All Pages to End)'
+          ? 'کشف مسیرهای جدید (Discovery Frontier Scan)'
+          : 'Discover New Paths (Sitemap, Documents & Deep Leak Pages)'
+        : mode === 'deep_spider'
+        ? lang === 'fa'
+          ? 'خزش عنکبوتی عمیق (Deep Spider — فقط مسیرهای جدید)'
+          : 'Deep Spider Crawl (Unseen Frontier Paths to End)'
+        : mode === 'check_updates'
+        ? lang === 'fa'
+          ? 'بررسی آپدیت مسیرهای قبلی (Check Updates)'
+          : 'Check Updates (Verify Older & Recent Paths)'
         : lang === 'fa'
         ? 'بررسی و دریافت بروزرسانی‌های سرور (Lookup Server)'
-        : 'Server Lookup & Incremental Spider'
-    );
+        : 'Server Lookup & Incremental Spider';
+
+    setCrawlModeLabel(modeTitle);
     setBusyAction('update');
     setBannerMessage(null);
     try {
@@ -895,6 +1194,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          mode: mode === 'incremental' ? undefined : mode,
           max_items: maxItems,
           deep_spider: deepSpider,
           simulate_interrupt_after: simulateInterruptAfter,
@@ -908,28 +1208,45 @@ export default function App() {
         const updCount = json.job.updated_records_count ?? 0;
         const procCount = json.job.processed_count ?? 0;
         const discCount = json.job.total_discovered ?? procCount;
+        const pendingFrontier = json.frontier_stats?.pending ?? 0;
         if (status === 'FAILED' || status === 'SUSPENDED') {
           setBannerMessage({
             text:
               lang === 'fa'
-                ? `خطا در دریافت از سرور (${status}): ${json.job.error_summary || 'خطای شبکه'}`
-                : `Server update ${status.toLowerCase()}: ${json.job.error_summary || 'Network error'}`,
+                ? `خطا در عملیات (${status}): ${json.job.error_summary || 'خطای شبکه'}`
+                : `Crawler ${status.toLowerCase()}: ${json.job.error_summary || 'Network error'}`,
             type: 'error',
           });
         } else if (status === 'INTERRUPTED') {
           setBannerMessage({
             text:
               lang === 'fa'
-                ? `خزش در نقطه بازیابی متوقف شد (Job #${json.job.id} — ${newCount} رکورد جدید ذخیره شد، ${procCount} از ${discCount} لینک بررسی شد). هر زمان بخواهید می‌توانید از بخش تاریخچه آن را ادامه دهید.`
-                : `Spider crawl stopped with verified checkpoint (Job #${json.job.id} — ${newCount} new records saved, ${procCount}/${discCount} links processed). Click Resume anytime in Collection History.`,
+                ? `عملیات توسط کاربر متوقف شد (Job #${json.job.id} — ${newCount} مورد جدید ذخیره شد، ${pendingFrontier} مسیر جدید در صف خزش باقی مانده است).`
+                : `Operation stopped cleanly by user (Job #${json.job.id} — ${newCount} new saved, ${pendingFrontier} unseen paths queued in frontier).`,
+            type: 'info',
+          });
+        } else if (mode === 'discover') {
+          setBannerMessage({
+            text:
+              lang === 'fa'
+                ? `کشف مسیرهای جدید کامل شد: ${newCount} لینک جدید کشف و در صف قرار گرفت (مجموع مسیرهای آماده خزش: ${pendingFrontier}). حالا روی «Deep Spider» کلیک کنید.`
+                : `Discovery complete: ${newCount} brand-new unseen path(s) queued across ${procCount} hub/leak pages (${pendingFrontier} pending in frontier). Click "Deep Spider" to extract them.`,
+            type: 'info',
+          });
+        } else if (mode === 'check_updates') {
+          setBannerMessage({
+            text:
+              lang === 'fa'
+                ? `بررسی آپدیت مسیرهای قبلی کامل شد: ${procCount} مسیر بررسی شد (${newCount} مورد جدید، ${updCount} مورد تغییر یافته).`
+                : `Update Check complete: verified ${procCount} recent & older archived paths (${newCount} new, ${updCount} updated).`,
             type: 'info',
           });
         } else {
           setBannerMessage({
             text:
               lang === 'fa'
-                ? `خزش عمیق (Deep Spider) از سرور wikiran.org تکمیل شد: ${newCount} رکورد جدید دانلود و اضافه شد، ${updCount} رکورد بروزرسانی شد (${procCount} صفحه از ${discCount} لینک کشف‌شده بررسی شد).`
-                : `Deep Spider crawl from wikiran.org complete: ${newCount} NEW records downloaded & indexed, ${updCount} updated (${procCount} pages processed out of ${discCount} discovered links).`,
+                ? `خزش عمیق (Deep Spider) کامل شد: ${newCount} رکورد جدید دانلود و ذخیره شد، ${updCount} مورد بروزرسانی شد (${procCount} از ${discCount} مسیر بررسی شد · ${pendingFrontier} مسیر جدید دیگر در صف).`
+                : `Deep Spider crawl complete: ${newCount} NEW records extracted & indexed, ${updCount} updated (${procCount}/${discCount} paths processed · ${pendingFrontier} unseen paths remaining in frontier).`,
             type: 'info',
           });
         }
@@ -1164,6 +1481,20 @@ export default function App() {
       icon: <Search className="w-4 h-4 text-indigo-400 shrink-0" />,
       activeClass: 'bg-indigo-600 text-white shadow-xs',
       dotClass: 'bg-indigo-400',
+    },
+    {
+      id: 'watchlist',
+      label: lang === 'fa' ? 'غربالگری گروهی (Excel/CSV)' : 'Batch Watchlist Screener',
+      icon: <ClipboardList className="w-4 h-4 text-rose-400 shrink-0" />,
+      activeClass: 'bg-rose-600 text-white shadow-xs',
+      dotClass: 'bg-rose-400',
+    },
+    {
+      id: 'targeted_leaks',
+      label: lang === 'fa' ? 'دانلود هدفمند افشاگری‌ها' : 'Targeted Leak Downloader',
+      icon: <HardDriveDownload className="w-4 h-4 text-cyan-400 shrink-0" />,
+      activeClass: 'bg-cyan-600 text-white shadow-xs',
+      dotClass: 'bg-cyan-400',
     },
     {
       id: 'exports',
@@ -1623,6 +1954,7 @@ export default function App() {
             const artCount = sv?.articles_count ?? data.stats.articles_count;
             const pubCount = sv?.publications_count ?? data.stats.publications_count;
             const ofacCount = sv?.ofac_entities_count ?? data.ofac_summary?.total_entities ?? 0;
+            const osCount = sv?.opensanctions_count ?? data.opensanctions_summary?.total_entities ?? 0;
             const csvCount = sv?.csv_rows_count ?? 0;
             const dbSharePct =
               sv && sv.total_bytes > 0
@@ -1636,7 +1968,7 @@ export default function App() {
                     <HardDrive className="w-3.5 h-3.5 shrink-0" />
                     <span>{lang === 'fa' ? 'حجم و اندازه داده‌ها' : 'Data Size & Volume'}</span>
                   </div>
-                  {(isCrawlingNow || busyAction === 'ofac_sync') && (
+                  {(isCrawlingNow || busyAction === 'ofac_sync' || busyAction === 'os_sync') && (
                     <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-300">
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                       LIVE
@@ -1682,15 +2014,23 @@ export default function App() {
                         ? `${artCount} مقاله · ${pubCount} فهرست`
                         : `${artCount} Art · ${pubCount} Cat`}
                     </span>
-                    {ofacCount > 0 ? (
-                      <span className="text-rose-300 font-semibold">
-                        {ofacCount.toLocaleString()} OFAC
-                      </span>
-                    ) : csvCount > 0 ? (
-                      <span className="text-sky-300/90">
-                        {lang === 'fa' ? `${csvCount} ردیف CSV` : `${csvCount} CSV`}
-                      </span>
-                    ) : null}
+                    <span className="flex items-center gap-1.5">
+                      {ofacCount > 0 && (
+                        <span className="text-rose-300 font-semibold">
+                          {ofacCount.toLocaleString()} OFAC
+                        </span>
+                      )}
+                      {osCount > 0 && (
+                        <span className="text-amber-300 font-semibold">
+                          {osCount.toLocaleString()} OS
+                        </span>
+                      )}
+                      {ofacCount === 0 && osCount === 0 && csvCount > 0 && (
+                        <span className="text-sky-300/90">
+                          {lang === 'fa' ? `${csvCount} ردیف CSV` : `${csvCount} CSV`}
+                        </span>
+                      )}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1974,118 +2314,319 @@ export default function App() {
                   </div>
                 )}
 
-                {/* LIVE CRAWLING & SERVER LOOKUP ACTIVITY MONITOR */}
-                {isCrawlingNow && (
-                  <div className="bg-slate-950 text-slate-100 border-b border-sky-500/40 px-5 sm:px-6 py-4 space-y-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <span className="relative flex h-3 w-3 shrink-0">
-                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                          <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500" />
-                        </span>
-                        <Activity className="w-4 h-4 text-sky-400 shrink-0" />
-                        <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
-                          {lang === 'fa' ? 'در حال خزش زنده' : 'LIVE SPIDER ACTIVE'}
-                        </span>
-                        <span className="text-xs text-slate-300 truncate">
-                          · {crawlModeLabel || (lang === 'fa' ? 'بررسی سرور wikiran.org' : 'Crawling wikiran.org')}
-                        </span>
-                      </div>
+                {/* POLISHED ACTIVE SPIDER MONITOR WITH CSS RADAR VISUAL INDICATOR & 4 CONTROLS */}
+                {(() => {
+                  const job = liveCrawlStatus?.active_job || data.stats.last_job;
+                  const frontier = liveCrawlStatus?.frontier_stats || data.frontier_stats;
+                  const isRunningJob = Boolean(isCrawlingNow || (job && job.status === 'RUNNING'));
+                  const discovered = isRunningJob && job ? job.total_discovered : frontier?.total ?? 0;
+                  const processed = isRunningJob && job ? job.processed_count : frontier?.crawled ?? 0;
+                  const newRecs = isRunningJob && job ? job.new_records_count : 0;
+                  const pendingFrontier = frontier?.pending ?? 0;
+                  const pct =
+                    isRunningJob && discovered > 0
+                      ? Math.min(100, Math.round((processed / discovered) * 100))
+                      : 0;
 
-                      <div className="flex items-center gap-3 shrink-0">
-                        <span className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 font-mono-tabular text-xs text-sky-300">
-                          {String(Math.floor(crawlElapsedSec / 60)).padStart(2, '0')}:
-                          {String(crawlElapsedSec % 60).padStart(2, '0')}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={handleStopCrawl}
-                          className="px-3 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-md inline-flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
-                        >
-                          <Square className="w-3 h-3 fill-current" />
-                          <span>{lang === 'fa' ? 'توقف فوری (Stop)' : 'Stop Crawl'}</span>
-                        </button>
-                      </div>
-                    </div>
+                  return (
+                    <div className="p-4 sm:p-5 bg-slate-100/70 border-b border-slate-200">
+                      <div
+                        className={`rounded-xl bg-slate-950 text-slate-100 p-4 sm:p-5 space-y-4 transition-all ${
+                          isRunningJob
+                            ? 'border-2 border-emerald-400 shadow-lg ring-4 ring-emerald-500/15'
+                            : 'border-2 border-slate-700 shadow-md'
+                        }`}
+                      >
+                        {/* Top Bar: Animated CSS Radar + Title + Elapsed + 4 Action Buttons */}
+                        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                          <div className="flex items-center gap-3.5 min-w-0">
+                            {/* CSS-Animated Spider Radar Visual Indicator */}
+                            <div className="relative w-14 h-14 shrink-0 flex items-center justify-center rounded-xl bg-slate-900 border border-slate-700/90 shadow-inner overflow-hidden">
+                              <svg
+                                viewBox="0 0 64 64"
+                                className="w-12 h-12"
+                                aria-hidden="true"
+                              >
+                                {/* Concentric Web Rings */}
+                                <circle
+                                  cx="32"
+                                  cy="32"
+                                  r="26"
+                                  fill="none"
+                                  stroke={isRunningJob ? '#10B981' : '#475569'}
+                                  strokeWidth="1"
+                                  strokeOpacity="0.35"
+                                />
+                                <circle
+                                  cx="32"
+                                  cy="32"
+                                  r="17"
+                                  fill="none"
+                                  stroke={isRunningJob ? '#38BDF8' : '#475569'}
+                                  strokeWidth="1"
+                                  strokeDasharray="3 3"
+                                  strokeOpacity="0.45"
+                                />
+                                <circle
+                                  cx="32"
+                                  cy="32"
+                                  r="8"
+                                  fill="none"
+                                  stroke={isRunningJob ? '#10B981' : '#64748B'}
+                                  strokeWidth="1"
+                                  strokeOpacity="0.55"
+                                />
+                                {/* Web Spokes */}
+                                <line x1="32" y1="6" x2="32" y2="58" stroke="#334155" strokeWidth="0.9" />
+                                <line x1="6" y1="32" x2="58" y2="32" stroke="#334155" strokeWidth="0.9" />
+                                <line x1="13" y1="13" x2="51" y2="51" stroke="#334155" strokeWidth="0.8" />
+                                <line x1="51" y1="13" x2="13" y2="51" stroke="#334155" strokeWidth="0.8" />
 
-                    {/* Live Progress Bar & Metrics */}
-                    {(() => {
-                      const job = liveCrawlStatus?.active_job;
-                      const isRunningJob = job && job.status === 'RUNNING';
-                      const discovered = isRunningJob ? job.total_discovered : 0;
-                      const processed = isRunningJob ? job.processed_count : 0;
-                      const newRecs = isRunningJob ? job.new_records_count : 0;
-                      const pct =
-                        discovered > 0
-                          ? Math.min(100, Math.round((processed / discovered) * 100))
-                          : 0;
+                                {isRunningJob && (
+                                  <>
+                                    {/* Expanding Radar Pulses */}
+                                    <circle
+                                      cx="32"
+                                      cy="32"
+                                      r="20"
+                                      fill="none"
+                                      stroke="#34D399"
+                                      strokeWidth="2"
+                                      className="animate-spider-pulse-1"
+                                    />
+                                    <circle
+                                      cx="32"
+                                      cy="32"
+                                      r="20"
+                                      fill="none"
+                                      stroke="#38BDF8"
+                                      strokeWidth="1.5"
+                                      className="animate-spider-pulse-2"
+                                    />
+                                    {/* Rotating Radar Sweep Wedge */}
+                                    <g className="animate-spider-radar">
+                                      <path
+                                        d="M32 32 L32 6 A26 26 0 0 1 54.5 19 Z"
+                                        fill="rgba(16, 185, 129, 0.28)"
+                                      />
+                                      <line
+                                        x1="32"
+                                        y1="32"
+                                        x2="32"
+                                        y2="6"
+                                        stroke="#34D399"
+                                        strokeWidth="2"
+                                        strokeLinecap="round"
+                                      />
+                                    </g>
+                                    {/* Pulsing Target Nodes on the Spider Web */}
+                                    <circle cx="44" cy="19" r="2.6" fill="#34D399" className="animate-spider-node-a" />
+                                    <circle cx="19" cy="41" r="2.4" fill="#38BDF8" className="animate-spider-node-b" />
+                                    <circle cx="46" cy="43" r="2.2" fill="#FBBF24" className="animate-spider-node-c" />
+                                  </>
+                                )}
+                                {/* Center Spider Core */}
+                                <circle
+                                  cx="32"
+                                  cy="32"
+                                  r="4.2"
+                                  fill={isRunningJob ? '#10B981' : '#38BDF8'}
+                                />
+                              </svg>
+                            </div>
 
-                      return (
-                        <div className="space-y-2.5">
-                          <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div className="min-w-0 space-y-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span
+                                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-extrabold uppercase tracking-wider ${
+                                    isRunningJob
+                                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/50'
+                                      : 'bg-slate-800 text-sky-300 border border-slate-600'
+                                  }`}
+                                >
+                                  <span
+                                    className={`w-2 h-2 rounded-full ${
+                                      isRunningJob ? 'bg-emerald-400 animate-ping' : 'bg-sky-400'
+                                    }`}
+                                  />
+                                  {isRunningJob
+                                    ? lang === 'fa'
+                                      ? 'خزنده زنده فعال است'
+                                      : 'ACTIVE SPIDER RUNNING'
+                                    : lang === 'fa'
+                                    ? 'مانیتور خزنده آماده (Standby)'
+                                    : 'ACTIVE SPIDER MONITOR · READY'}
+                                </span>
+                                {isRunningJob && (
+                                  <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono-tabular text-xs font-bold text-sky-300">
+                                    {String(Math.floor(crawlElapsedSec / 60)).padStart(2, '0')}:
+                                    {String(crawlElapsedSec % 60).padStart(2, '0')}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-sm sm:text-base font-bold text-white tracking-tight truncate">
+                                {isRunningJob
+                                  ? crawlModeLabel ||
+                                    (lang === 'fa'
+                                      ? 'خزش عمیق در wikiran.org'
+                                      : 'Deep Spidering wikiran.org')
+                                  : lang === 'fa'
+                                  ? 'کنترل ۴گانه خزنده: کشف مسیر جدید · خزش عمیق · بررسی آپدیت · توقف'
+                                  : '4-Mode Spider Engine: Discover New · Deep Crawl · Check Updates · Stop'}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* 4 Distinct Required Spider Buttons */}
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateArchive(undefined, 25, true, 'discover')}
+                              disabled={isRunningJob}
+                              className="px-3.5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              title={
+                                lang === 'fa'
+                                  ? 'اسکن عمیق نقشه سایت، اسناد و صفحات جدید لیک‌ها برای کشف مسیرهای دانلودنشده'
+                                  : 'Scan sitemaps, documents & deep leak pagination to discover brand-new unseen paths'
+                              }
+                            >
+                              <Search className="w-3.5 h-3.5 shrink-0" />
+                              <span>{lang === 'fa' ? '۱. کشف مسیر جدید' : '1. Discover'}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateArchive(undefined, 120, true, 'deep_spider')}
+                              disabled={isRunningJob}
+                              className="px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              title={
+                                lang === 'fa'
+                                  ? 'خزش عمیق تا انتهای مسیرهای جدید کشف‌شده بدون تکرار موارد قبلی'
+                                  : 'Crawl deeply through unseen frontier paths & nested links without repeating archived items'
+                              }
+                            >
+                              <Activity className="w-3.5 h-3.5 shrink-0" />
+                              <span>{lang === 'fa' ? '۲. خزش عمیق (Spider)' : '2. Deep Spider'}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateArchive(undefined, 25, false, 'check_updates')}
+                              disabled={isRunningJob}
+                              className="px-3.5 py-2 text-xs font-bold text-white bg-sky-600 hover:bg-sky-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              title={
+                                lang === 'fa'
+                                  ? 'فقط بررسی مسیرهای قدیمی و صفحه اول جهت یافتن تغییرات و آپدیت‌های جدید'
+                                  : 'Only re-check older downloaded paths & front feeds for modified/new records'
+                              }
+                            >
+                              <RefreshCw
+                                className={`w-3.5 h-3.5 shrink-0 ${
+                                  isRunningJob ? 'animate-spin' : ''
+                                }`}
+                              />
+                              <span>{lang === 'fa' ? '۳. بررسی آپدیت' : '3. Check Updates'}</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={handleStopCrawl}
+                              disabled={!isRunningJob}
+                              className={`px-3.5 py-2 text-xs font-bold rounded-lg transition-all inline-flex items-center gap-1.5 ${
+                                isRunningJob
+                                  ? 'bg-rose-600 hover:bg-rose-500 text-white cursor-pointer shadow-md ring-2 ring-rose-400/60'
+                                  : 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
+                              }`}
+                            >
+                              <Square className="w-3 h-3 fill-current shrink-0" />
+                              <span>{lang === 'fa' ? '۴. توقف (Stop)' : '4. Stop'}</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Live Progress Bar with Animated Shimmer */}
+                        {isRunningJob && (
+                          <div className="relative w-full h-2.5 bg-slate-800 rounded-full overflow-hidden border border-slate-700">
                             {discovered > 0 ? (
                               <div
-                                className="h-full bg-gradient-to-r from-sky-500 via-cyan-400 to-emerald-400 transition-all duration-500"
-                                style={{ width: `${Math.max(8, pct)}%` }}
-                              />
+                                className="h-full bg-gradient-to-r from-indigo-500 via-sky-400 to-emerald-400 transition-all duration-500 relative overflow-hidden"
+                                style={{ width: `${Math.max(10, pct)}%` }}
+                              >
+                                <div className="absolute inset-0 w-1/2 bg-white/30 blur-xs animate-spider-shimmer" />
+                              </div>
                             ) : (
-                              <div className="h-full w-2/5 bg-gradient-to-r from-sky-500 via-cyan-400 to-emerald-400 animate-pulse rounded-full" />
+                              <div className="h-full w-2/5 bg-gradient-to-r from-indigo-500 via-sky-400 to-emerald-400 animate-spider-shimmer rounded-full" />
                             )}
                           </div>
+                        )}
 
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
-                              <span className="text-slate-400">
-                                {lang === 'fa' ? 'لینک کشف‌شده' : 'Discovered'}
-                              </span>
-                              <span className="font-mono-tabular font-bold text-sky-300">
-                                {discovered > 0 ? discovered : 'Scanning…'}
-                              </span>
+                        {/* High-Contrast Live Metrics Strip */}
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                            <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                              {lang === 'fa' ? 'مسیرهای جدید در صف' : 'Unseen Frontier Queue'}
                             </div>
-                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
-                              <span className="text-slate-400">
-                                {lang === 'fa' ? 'صفحه بررسی‌شده' : 'Processed'}
-                              </span>
-                              <span className="font-mono-tabular font-bold text-cyan-300">
-                                {processed}
-                                {discovered > 0 ? ` / ${discovered}` : ''}
-                              </span>
-                            </div>
-                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
-                              <span className="text-slate-400">
-                                {lang === 'fa' ? 'رکورد جدید' : 'New Saved'}
-                              </span>
-                              <span className="font-mono-tabular font-bold text-emerald-400">
-                                +{newRecs}
-                              </span>
-                            </div>
-                            <div className="bg-slate-900/90 border border-slate-800 rounded-md px-3 py-2 flex items-center justify-between">
-                              <span className="text-slate-400">
-                                {lang === 'fa' ? 'کل آرشیو' : 'Archive Total'}
-                              </span>
-                              <span className="font-mono-tabular font-bold text-amber-300">
-                                {(liveCrawlStatus?.articles_count ?? data.stats.articles_count) +
-                                  (liveCrawlStatus?.publications_count ??
-                                    data.stats.publications_count)}
-                              </span>
+                            <div className="text-xl font-extrabold font-mono-tabular text-indigo-300 mt-1">
+                              {pendingFrontier.toLocaleString()}
                             </div>
                           </div>
 
-                          {/* Live URL Stream from SQLite collection_history */}
-                          <div className="bg-slate-900/80 border border-slate-800 rounded-md px-3 py-2 space-y-1 max-h-28 overflow-y-auto font-mono-tabular text-[11px]">
-                            <div className="text-sky-400 flex items-center gap-1.5">
-                              <RefreshCw className="w-3 h-3 animate-spin shrink-0" />
+                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                            <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                              {isRunningJob
+                                ? lang === 'fa'
+                                  ? 'صفحه پردازش‌شده'
+                                  : 'Processed Now'
+                                : lang === 'fa'
+                                ? 'مسیرهای بررسی‌شده'
+                                : 'Frontier Crawled'}
+                            </div>
+                            <div className="text-xl font-extrabold font-mono-tabular text-sky-300 mt-1">
+                              {processed.toLocaleString()}
+                              {isRunningJob && discovered > 0 ? ` / ${discovered}` : ''}
+                            </div>
+                          </div>
+
+                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                            <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                              {lang === 'fa' ? 'رکورد جدید ذخیره‌شده' : 'New Saved (Run)'}
+                            </div>
+                            <div className="text-xl font-extrabold font-mono-tabular text-emerald-400 mt-1">
+                              +{newRecs.toLocaleString()}
+                            </div>
+                          </div>
+
+                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                            <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                              {lang === 'fa' ? 'کل آرشیو ویکی‌ایران' : 'WikIran Archived'}
+                            </div>
+                            <div className="text-xl font-extrabold font-mono-tabular text-amber-300 mt-1">
+                              {(
+                                (liveCrawlStatus?.articles_count ?? data.stats.articles_count) +
+                                (liveCrawlStatus?.publications_count ??
+                                  data.stats.publications_count) +
+                                (data.wikiran_docs_summary?.total ?? 0)
+                              ).toLocaleString()}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Live URL Stream Ticker when Running */}
+                        {isRunningJob && (
+                          <div className="bg-slate-900/90 border border-slate-700/80 rounded-lg px-3.5 py-2.5 space-y-1 max-h-32 overflow-y-auto font-mono-tabular text-[11px]">
+                            <div className="text-emerald-300 flex items-center gap-2 font-semibold">
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
                               <span className="truncate">
                                 {pipelineLog ||
                                   (lang === 'fa'
-                                    ? 'در حال بررسی robots.txt، صفحات مقالات و لینک‌های داخلی wikiran.org...'
-                                    : 'Inspecting robots.txt, paginated feeds (/search?tabType=articles), /leaks & internal links...')}
+                                    ? 'خزنده در حال پیمایش مسیرهای جدید، صفحات لیک‌ها و استخراج لینک‌های داخلی است...'
+                                    : 'Spider advancing pagination cursors across /search, /leaks/<slug>?page=K & nested links...')}
                               </span>
                             </div>
                             {(liveCrawlStatus?.recent_history || []).slice(0, 4).map((item) => (
                               <div
                                 key={item.id}
-                                className="flex items-center justify-between gap-2 text-slate-300 border-t border-slate-800/70 pt-1"
+                                className="flex items-center justify-between gap-2 text-slate-300 border-t border-slate-800 pt-1"
                               >
                                 <span className="truncate">
                                   <span
@@ -2101,19 +2642,19 @@ export default function App() {
                                   </span>
                                   {item.target_url.replace('https://wikiran.org', '')}
                                 </span>
-                                <span className="text-slate-500 shrink-0">{item.record_type}</span>
+                                <span className="text-slate-400 shrink-0">{item.record_type}</span>
                               </div>
                             ))}
                           </div>
-                        </div>
-                      );
-                    })()}
-                  </div>
-                )}
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* 4 Color-Distinguished Operational Steps */}
                 <div className="p-4 sm:p-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  {/* Step 1: Sky Blue — Lookup Server Updates (Polished Deep Spider Control Card) */}
+                  {/* Step 1: Sky Blue — Lookup Server Updates (Summary Card linked to 4-Mode Spider) */}
                   <div
                     className={`rounded-xl p-4 border-2 border-t-4 border-t-sky-600 transition-all flex flex-col justify-between space-y-4 shadow-xs ${
                       isCrawlingNow
@@ -2140,53 +2681,42 @@ export default function App() {
                       <p className="text-xs text-slate-600 leading-relaxed">{t.step1Desc}</p>
                     </div>
 
-                    {/* Polished 3-Button Spider Control Tray */}
-                    <div className="bg-white border border-sky-200/90 rounded-lg p-2 space-y-2 shadow-2xs">
-                      <div className="grid grid-cols-12 gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => handleUpdateArchive(undefined, 12, true)}
-                          disabled={isCrawlingNow}
-                          className="col-span-8 py-2 px-2.5 text-xs font-bold text-white bg-sky-700 hover:bg-sky-800 active:bg-sky-900 rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-55 shadow-2xs"
-                        >
-                          <RefreshCw
-                            className={`w-3.5 h-3.5 shrink-0 ${
-                              isCrawlingNow ? 'animate-spin' : ''
-                            }`}
-                          />
-                          <span className="truncate">{t.step1Action}</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleStopCrawl}
-                          disabled={!isCrawlingNow}
-                          title={
-                            lang === 'fa'
-                              ? 'توقف خزش و ذخیره نقطه بازیابی (Stop)'
-                              : 'Stop spider crawling & save checkpoint'
-                          }
-                          className={`col-span-4 py-2 px-2 text-xs font-bold rounded-md transition-all inline-flex items-center justify-center gap-1 ${
-                            isCrawlingNow
-                              ? 'bg-red-600 text-white hover:bg-red-700 cursor-pointer shadow-xs ring-2 ring-red-200'
-                              : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
-                          }`}
-                        >
-                          <Square className="w-3 h-3 fill-current shrink-0" />
-                          <span>{lang === 'fa' ? 'توقف' : 'Stop'}</span>
-                        </button>
-                      </div>
+                    <div className="grid grid-cols-2 gap-1.5">
                       <button
                         type="button"
-                        onClick={() => handleUpdateArchive(undefined, 0, true)}
+                        onClick={() => handleUpdateArchive(undefined, 25, true, 'discover')}
                         disabled={isCrawlingNow}
-                        className="w-full py-2 px-2.5 text-[11px] font-bold text-indigo-900 bg-indigo-50/80 hover:bg-indigo-100 border border-indigo-200 rounded-md transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        className="py-2 px-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-md transition-colors cursor-pointer disabled:opacity-50"
                       >
-                        <Activity className="w-3.5 h-3.5 text-indigo-700 shrink-0" />
-                        <span className="truncate">
-                          {lang === 'fa'
-                            ? 'خزش عنکبوتی کامل (تمام صفحات تا صفحه آخر)'
-                            : 'Deep Spider Crawl (All Pages & Links)'}
-                        </span>
+                        {lang === 'fa' ? 'کشف مسیر' : 'Discover'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleUpdateArchive(undefined, 120, true, 'deep_spider')}
+                        disabled={isCrawlingNow}
+                        className="py-2 px-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        {lang === 'fa' ? 'خزش عمیق' : 'Deep Spider'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleUpdateArchive(undefined, 25, false, 'check_updates')}
+                        disabled={isCrawlingNow}
+                        className="py-2 px-2 text-xs font-bold text-white bg-sky-700 hover:bg-sky-800 rounded-md transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        {lang === 'fa' ? 'بررسی آپدیت' : 'Check Updates'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleStopCrawl}
+                        disabled={!isCrawlingNow}
+                        className={`py-2 px-2 text-xs font-bold rounded-md transition-colors ${
+                          isCrawlingNow
+                            ? 'bg-rose-600 text-white hover:bg-rose-700 cursor-pointer'
+                            : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
+                        }`}
+                      >
+                        {lang === 'fa' ? 'توقف' : 'Stop'}
                       </button>
                     </div>
                   </div>
@@ -2263,6 +2793,107 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                {/* WikIran Structured Archives (Front Companies 2,007 + Vessels 561 + Auto-Cached Leak Docs) */}
+                {(() => {
+                  const wsum = data.wikiran_docs_summary;
+                  const fcCount = wsum?.front_companies ?? 0;
+                  const vsCount = wsum?.vessels ?? 0;
+                  const cachedLeaks = (wsum?.leaked_emails ?? 0) + (wsum?.leaked_files ?? 0);
+                  const isSyncingWikIran =
+                    busyAction === 'wikiran_sync_both' ||
+                    busyAction === 'wikiran_sync_front-companies' ||
+                    busyAction === 'wikiran_sync_vessels';
+                  return (
+                    <div className="px-4 sm:px-6 pb-5 pt-1">
+                      <div className="rounded-xl border-2 border-indigo-200 bg-indigo-50/50 p-4 space-y-3">
+                        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-indigo-700 text-white rounded">
+                                WIKIRAN FULL COVERAGE
+                              </span>
+                              <h3 className="text-sm font-bold text-slate-900">
+                                {lang === 'fa'
+                                  ? 'آرشیو شرکت‌های پوششی (۲٬۰۰۷) و کشتی‌ها (۵۶۱) + جستجوی زنده ۵۰۰٬۰۰۰+ سند افشاشده'
+                                  : 'WikIran Front Companies (2,007) & Vessels (561) Offline + Live Search across 500,000+ Leak Docs'}
+                              </h3>
+                            </div>
+                            <p className="text-xs text-slate-600 leading-relaxed max-w-3xl">
+                              {lang === 'fa'
+                                ? 'ویکی‌ایران بیش از ۵۰۰٬۰۰۰ ایمیل و فایل خام در ۲۸ مجموعه افشا دارد. تمام ۲٬۰۰۷ شرکت پوششی و ۵۶۱ کشتی به‌صورت کامل آفلاین ذخیره می‌شوند و هر نامی که در بخش Search & Screen جستجو کنید، همزمان در کل سرور زنده ویکی‌ایران نیز جستجو و به‌طور خودکار آفلاین کش می‌شود.'
+                                : 'WikIran hosts 500,000+ raw leaked emails and files across 28 leak collections. Download all 2,007 Front Companies & 561 Vessels offline in one click below — and whenever you search a name in Search & Screen while online, the app also queries WikIran’s full live archive and automatically caches every match offline.'}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              disabled={busyAction !== null || isOffline}
+                              onClick={() => handleSyncWikIranArchives('both')}
+                              className="px-4 py-2 text-xs font-bold text-white bg-indigo-700 hover:bg-indigo-800 rounded-md transition-colors inline-flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-60"
+                            >
+                              <HardDriveDownload
+                                className={`w-3.5 h-3.5 ${isSyncingWikIran ? 'animate-pulse' : ''}`}
+                              />
+                              <span>
+                                {isSyncingWikIran
+                                  ? lang === 'fa'
+                                    ? 'در حال دانلود شرکت‌های پوششی و کشتی‌ها...'
+                                    : 'Syncing Front Companies & Vessels...'
+                                  : lang === 'fa'
+                                  ? 'دانلود آفلاین شرکت‌های پوششی (۲٬۰۰۷) و کشتی‌ها (۵۶۱)'
+                                  : 'Sync Front Companies (2,007) & Vessels (561) Offline'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {wikiranSyncNote && (
+                          <div className="px-3 py-2 rounded-md bg-emerald-50 border border-emerald-200 text-xs font-medium text-emerald-950">
+                            {wikiranSyncNote}
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                          <div className="bg-white border border-indigo-200/80 rounded-lg px-3 py-2">
+                            <div className="text-[11px] text-slate-500 font-medium">
+                              {lang === 'fa' ? 'شرکت‌های پوششی (آفلاین)' : 'Front Companies Offline'}
+                            </div>
+                            <div className="text-lg font-extrabold font-mono-tabular text-indigo-900">
+                              {fcCount.toLocaleString()}{' '}
+                              <span className="text-[11px] font-normal text-slate-400">/ 2,007</span>
+                            </div>
+                          </div>
+                          <div className="bg-white border border-indigo-200/80 rounded-lg px-3 py-2">
+                            <div className="text-[11px] text-slate-500 font-medium">
+                              {lang === 'fa' ? 'کشتی‌ها (آفلاین)' : 'Vessels Archive Offline'}
+                            </div>
+                            <div className="text-lg font-extrabold font-mono-tabular text-sky-900">
+                              {vsCount.toLocaleString()}{' '}
+                              <span className="text-[11px] font-normal text-slate-400">/ 561</span>
+                            </div>
+                          </div>
+                          <div className="bg-white border border-indigo-200/80 rounded-lg px-3 py-2">
+                            <div className="text-[11px] text-slate-500 font-medium">
+                              {lang === 'fa' ? 'اسناد و ایمیل‌های کش‌شده' : 'Cached Leak Emails/Files'}
+                            </div>
+                            <div className="text-lg font-extrabold font-mono-tabular text-emerald-900">
+                              {cachedLeaks.toLocaleString()}
+                            </div>
+                          </div>
+                          <div className="bg-white border border-indigo-200/80 rounded-lg px-3 py-2">
+                            <div className="text-[11px] text-slate-500 font-medium">
+                              {lang === 'fa' ? 'مقالات و کاتالوگ‌ها' : 'Articles & Leak Guides'}
+                            </div>
+                            <div className="text-lg font-extrabold font-mono-tabular text-slate-900">
+                              {(data.stats.articles_count + data.stats.publications_count).toLocaleString()}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
               </section>
 
               {/* U.S. TREASURY OFAC SANCTIONS SUPER-DATASET (OFFLINE TRADE SCREENING + AUTO-UPDATE) */}
@@ -2430,6 +3061,170 @@ export default function App() {
                             className="px-2 py-0.5 text-[11px] font-mono-tabular font-semibold bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 rounded cursor-pointer transition-colors"
                           >
                             {p.program} ({p.count.toLocaleString()})
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                );
+              })()}
+
+              {/* OPENSANCTIONS GLOBAL SANCTIONS SUPER-DATASET (OFFLINE BULK + INDEX.JSON UPDATE CHECKER) */}
+              {(() => {
+                const os = data.opensanctions_summary;
+                const totalOs = os?.total_entities ?? 0;
+                const iranOs = os?.iran_related_count ?? 0;
+                const catalogCount = os?.catalog_datasets_count ?? 507;
+                const lastChange = os?.last_change ? os.last_change.slice(0, 10) : 'Not synced yet';
+                return (
+                  <section className="bg-white border-2 border-amber-300 rounded-xl p-5 sm:p-6 shadow-xs space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-wider rounded bg-amber-100 text-amber-950 border border-amber-300">
+                            OpenSanctions Global Consolidated
+                          </span>
+                          <span className="text-xs font-mono-tabular text-slate-500">
+                            data.opensanctions.org · UN + EU + UK + US + CH + CA + AU
+                          </span>
+                        </div>
+                        <h2 className="text-base sm:text-lg font-bold text-slate-900">
+                          {lang === 'fa'
+                            ? 'دیتاست جهانی تحریم‌های OpenSanctions (آفلاین + بررسی خودکار آپدیت)'
+                            : 'OpenSanctions Consolidated Global Sanctions (Offline + Auto-Update Check)'}
+                        </h2>
+                        <p className="text-xs text-slate-600 max-w-3xl">
+                          {lang === 'fa'
+                            ? 'تمامی لیست‌های تحریمی جهان (سازمان ملل، اتحادیه اروپا، انگلستان، آمریکا، سوئیس، کانادا و استرالیا) را یک‌بار دانلود و استخراج می‌کند تا به‌صورت آفلاین همراه با OFAC و ویکی‌ایران جستجو شوند.'
+                            : 'Downloads & extracts OpenSanctions consolidated global sanctions (UN, EU FSF, UK OFSI, US OFAC, Switzerland SECO, Canada, Australia, etc.) offline into SQLite FTS5 with one-click index.json update detection.'}
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleOpenSanctionsSync({ check_only: true })}
+                          disabled={busyAction !== null}
+                          className="px-3.5 py-2 text-xs font-semibold text-amber-950 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${busyAction === 'os_check' ? 'animate-spin' : ''}`}
+                          />
+                          <span>
+                            {lang === 'fa' ? 'بررسی آپدیت (index.json)' : 'Check index.json Updates'}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenSanctionsSync({ force: totalOs === 0 })}
+                          disabled={busyAction !== null}
+                          className="px-4 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>
+                            {busyAction === 'os_sync'
+                              ? lang === 'fa'
+                                ? 'در حال دانلود و استخراج OpenSanctions...'
+                                : 'Downloading & Extracting OpenSanctions...'
+                              : totalOs > 0
+                              ? lang === 'fa'
+                                ? 'به‌روزرسانی آفلاین OpenSanctions'
+                                : 'Sync OpenSanctions Updates'
+                              : lang === 'fa'
+                              ? 'دانلود و استخراج کامل OpenSanctions (آفلاین)'
+                              : 'Download & Extract Global Sanctions (Offline)'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {osStatusNote && (
+                      <div className="px-3.5 py-2 rounded-lg bg-amber-50 border border-amber-300 text-xs font-medium text-amber-950 flex items-center justify-between gap-2">
+                        <span>{osStatusNote}</span>
+                        <button
+                          type="button"
+                          onClick={() => setOsStatusNote(null)}
+                          className="text-amber-800 hover:text-amber-950 cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'کل اهداف تحریمی آفلاین' : 'Global Offline Targets'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-amber-700 mt-1">
+                          {totalOs.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          Consolidated Sanctions CSV
+                        </div>
+                      </div>
+                      <div className="bg-amber-50/70 border border-amber-200 rounded-lg p-3">
+                        <div className="text-[11px] text-amber-900 font-semibold">
+                          {lang === 'fa' ? 'مرتبط با ایران (IR / IRAN)' : 'Iran-Linked Global Targets'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-amber-800 mt-1">
+                          {iranOs.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-amber-700 mt-0.5">
+                          EU + UK + UN + US + CA + AU
+                        </div>
+                      </div>
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'دیتاست‌های رسمی کاتالوگ' : 'Catalog Datasets Indexed'}
+                        </div>
+                        <div className="text-xl font-bold font-mono-tabular text-slate-900 mt-1">
+                          {catalogCount.toLocaleString()}
+                        </div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          index.json live registry
+                        </div>
+                      </div>
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                        <div className="text-[11px] text-slate-500 font-medium">
+                          {lang === 'fa' ? 'آخرین تغییر OpenSanctions' : 'Last Dataset Change'}
+                        </div>
+                        <div className="text-base font-bold font-mono-tabular text-slate-900 mt-1">
+                          {lastChange}
+                        </div>
+                        <div className="text-[10px] text-emerald-700 font-semibold mt-0.5">
+                          {totalOs > 0
+                            ? lang === 'fa'
+                              ? 'آماده جستجوی آفلاین'
+                              : 'Offline FTS5 Ready'
+                            : lang === 'fa'
+                            ? 'روی دانلود کلیک کنید'
+                            : 'Click Download to sync'}
+                        </div>
+                      </div>
+                    </div>
+
+                    {os && os.top_source_lists && os.top_source_lists.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        <span className="text-[11px] font-bold text-slate-600 me-1">
+                          {lang === 'fa'
+                            ? 'منابع تحریمی برتر (کلیک برای استعلام):'
+                            : 'Top Global Source Lists (click to screen):'}
+                        </span>
+                        {os.top_source_lists.slice(0, 8).map((src) => (
+                          <button
+                            key={src.list}
+                            type="button"
+                            onClick={() => {
+                              setActiveNav('search');
+                              setSearchQuery(src.list);
+                              setFilterType('OPENSANCTIONS');
+                              setSearchScopeTab('ALL');
+                              runUniversalSearchWithQuery(src.list, { type: 'OPENSANCTIONS' });
+                            }}
+                            className="px-2 py-0.5 text-[11px] font-mono-tabular font-semibold bg-amber-50 hover:bg-amber-100 text-amber-950 border border-amber-200 rounded cursor-pointer transition-colors"
+                          >
+                            {src.list} ({src.count.toLocaleString()})
                           </button>
                         ))}
                       </div>
@@ -2732,6 +3527,14 @@ export default function App() {
             </div>
           )}
 
+          {activeNav === 'watchlist' && (
+            <BatchWatchlistPanel lang={lang} onDataUpdated={fetchOverview} />
+          )}
+
+          {activeNav === 'targeted_leaks' && (
+            <TargetedLeakDownloaderPanel lang={lang} onDataUpdated={fetchOverview} />
+          )}
+
           {/* 2. UNIVERSAL SEARCH ARCHIVE (Checks ALL Downloaded Data: Articles, Publications, Emails, Files, Banking IBANs, CSV Rows, Entities) */}
           {activeNav === 'search' && (
             <div className="space-y-6">
@@ -2763,12 +3566,53 @@ export default function App() {
                       setFilterType('ALL');
                       setFilterDateFrom('');
                       setFilterDateTo('');
+                      setActiveLeakSourceFilter('');
+                      setWikiranLiveMeta(null);
                       setSearchResults(null);
                     }}
                     className="px-4 py-2.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
                   >
                     {t.btnReset}
                   </button>
+                </div>
+
+                {/* Live Full-Archive WikIran Server Toggle (searches all 500,000+ emails, files, Front Companies & Vessels) */}
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-indigo-50/70 border border-indigo-200 text-xs">
+                  <label className="inline-flex items-center gap-2 font-semibold text-indigo-950 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={includeLiveWikIran && !isOffline}
+                      disabled={isOffline}
+                      onChange={(e) => {
+                        const next = e.target.checked;
+                        setIncludeLiveWikIran(next);
+                        if (searchQuery.trim()) {
+                          runUniversalSearchWithQuery(searchQuery, { includeLive: next });
+                        }
+                      }}
+                      className="w-4 h-4 accent-indigo-700 rounded cursor-pointer"
+                    />
+                    <span>
+                      {lang === 'fa'
+                        ? 'جستجوی همزمان در کل آرشیو زنده WikIran.org (بیش از ۵۰۰٬۰۰۰ ایمیل، سند، شرکت پوششی و کشتی + ذخیره خودکار آفلاین)'
+                        : 'Also query Live WikIran.org Full Archive (500,000+ leaked emails, PDFs, Front Companies & Vessels — auto-saves hits offline)'}
+                    </span>
+                  </label>
+                  <span
+                    className={`px-2 py-0.5 rounded font-bold text-[10px] uppercase ${
+                      isOffline
+                        ? 'bg-slate-200 text-slate-600'
+                        : includeLiveWikIran
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-200 text-slate-700'
+                    }`}
+                  >
+                    {isOffline
+                      ? 'Offline (Local Only)'
+                      : includeLiveWikIran
+                      ? 'Live + Offline Active'
+                      : 'Offline Only'}
+                  </span>
                 </div>
 
                 {/* Instant Sample Deep-Search Chips (Emails, Banking IBANs, Files, Companies) */}
@@ -2850,6 +3694,12 @@ export default function App() {
                     <option value="ALL">{t.filterSourceType}</option>
                     <option value="OFAC_SANCTION">
                       OFAC Sanctions Lists (SDN + Non-SDN Consolidated)
+                    </option>
+                    <option value="OPENSANCTIONS">
+                      OpenSanctions Global Consolidated (UN, EU, UK, US, CA, AU, CH)
+                    </option>
+                    <option value="WIKIRAN_DOC">
+                      WikIran Front Companies, Vessels & Cached Leak Docs
                     </option>
                     <option value="ARTICLE">Articles (/document/articles/*)</option>
                     <option value="PUBLICATION">Publication Catalogues (/leak/*)</option>
@@ -2994,47 +3844,53 @@ export default function App() {
                 const ofacMatches = displayedSearchResults.filter(
                   (r) => r.record_type === 'OFAC_SANCTION'
                 );
-                const wikiranMatches = displayedSearchResults.filter(
-                  (r) => r.record_type !== 'OFAC_SANCTION'
+                const osMatches = displayedSearchResults.filter(
+                  (r) => r.record_type === 'OPENSANCTIONS'
                 );
+                const wikiranMatches = displayedSearchResults.filter(
+                  (r) => r.record_type !== 'OFAC_SANCTION' && r.record_type !== 'OPENSANCTIONS'
+                );
+                const totalSanctionsHits = ofacMatches.length + osMatches.length;
                 const scopedResults =
                   searchScopeTab === 'OFAC'
                     ? ofacMatches
+                    : searchScopeTab === 'OPENSANCTIONS'
+                    ? osMatches
                     : searchScopeTab === 'WIKIRAN'
                     ? wikiranMatches
                     : displayedSearchResults;
 
                 return (
                   <div className="space-y-3">
-                    {/* Trade Counterparty OFAC + WikIran Screening Verdict Banner */}
+                    {/* Trade Counterparty OFAC + OpenSanctions + WikIran Screening Verdict Banner */}
                     {Boolean(searchQuery.trim()) && searchResults !== null && (
                       <div
                         className={`rounded-lg border-2 p-3.5 flex flex-wrap items-center justify-between gap-3 ${
-                          ofacMatches.length > 0
+                          totalSanctionsHits > 0
                             ? 'bg-rose-50 border-rose-300 text-rose-950'
                             : 'bg-emerald-50 border-emerald-300 text-emerald-950'
                         }`}
                       >
                         <div className="flex items-center gap-2.5">
-                          {ofacMatches.length > 0 ? (
+                          {totalSanctionsHits > 0 ? (
                             <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
                           ) : (
                             <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
                           )}
                           <div className="space-y-0.5">
                             <div className="text-xs sm:text-sm font-bold">
-                              {ofacMatches.length > 0
+                              {totalSanctionsHits > 0
                                 ? lang === 'fa'
-                                  ? `هشدار تحریم تجاری: ${ofacMatches.length} تطابق در لیست‌های تحریمی اوفک (OFAC) یافت شد!`
-                                  : `SANCTIONS SCREENING ALERT: ${ofacMatches.length} U.S. Treasury OFAC Match(es) Found!`
+                                  ? `هشدار تحریم تجاری: ${ofacMatches.length} تطابق در اوفک (OFAC) و ${osMatches.length} تطابق در OpenSanctions جهانی یافت شد!`
+                                  : `SANCTIONS SCREENING ALERT: ${ofacMatches.length} OFAC + ${osMatches.length} OpenSanctions Match(es) Found!`
                                 : lang === 'fa'
-                                ? `بدون تطابق در اوفک (0 مورد در ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} رکورد آفلاین OFAC)`
-                                : `OFAC Clear: 0 Sanctions Matches across ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} offline Treasury entities`}
+                                ? `بدون تطابق تحریمی در ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} رکورد OFAC و ${Number(data.opensanctions_summary?.total_entities || 0).toLocaleString()} رکورد OpenSanctions`
+                                : `Sanctions Clear: 0 Hits across ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} OFAC & ${Number(data.opensanctions_summary?.total_entities || 0).toLocaleString()} OpenSanctions offline records`}
                             </div>
                             <div className="text-[11px] opacity-85">
                               {lang === 'fa'
-                                ? `آرشیو ویکی‌ایران: ${wikiranMatches.length} رکورد منطبق · نسخه اوفک #${data.ofac_summary?.last_publication_id || '—'}`
-                                : `WikIran Archive: ${wikiranMatches.length} matching records · Offline OFAC Treasury Pub #${data.ofac_summary?.last_publication_id || '—'}`}
+                                ? `آرشیو ویکی‌ایران: ${wikiranMatches.length} رکورد · اوفک #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}`
+                                : `WikIran Archive: ${wikiranMatches.length} records · OFAC Pub #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}`}
                             </div>
                           </div>
                         </div>
@@ -3064,6 +3920,17 @@ export default function App() {
                           </button>
                           <button
                             type="button"
+                            onClick={() => setSearchScopeTab('OPENSANCTIONS')}
+                            className={`px-2.5 py-1 text-xs font-bold rounded border cursor-pointer transition-colors ${
+                              searchScopeTab === 'OPENSANCTIONS'
+                                ? 'bg-amber-600 text-white border-amber-600'
+                                : 'bg-white text-amber-900 border-amber-300 hover:bg-amber-50'
+                            }`}
+                          >
+                            OpenSanctions ({osMatches.length})
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setSearchScopeTab('WIKIRAN')}
                             className={`px-2.5 py-1 text-xs font-bold rounded border cursor-pointer transition-colors ${
                               searchScopeTab === 'WIKIRAN'
@@ -3077,13 +3944,93 @@ export default function App() {
                       </div>
                     )}
 
+                    {/* Live WikIran Full-Archive Server Results Banner + Clickable Leak Source Facets */}
+                    {wikiranLiveMeta && Boolean(searchQuery.trim()) && (
+                      <div className="rounded-lg border-2 border-indigo-300 bg-indigo-50/75 p-3.5 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-indigo-700 text-white rounded">
+                              {wikiranLiveMeta.online ? 'WIKIRAN.ORG LIVE SERVER' : 'WIKIRAN LIVE OFFLINE'}
+                            </span>
+                            <span className="text-xs sm:text-sm font-bold text-indigo-950">
+                              {wikiranLiveMeta.online
+                                ? lang === 'fa'
+                                  ? `سرور زنده ویکی‌ایران: ${wikiranLiveMeta.total_label} (${wikiranLiveMeta.fetched_count} مورد بارگذاری شد · ${wikiranLiveMeta.cached_new_count} مورد جدید آفلاین ذخیره شد)`
+                                  : `WikIran.org Full Archive: ${wikiranLiveMeta.total_label} (${wikiranLiveMeta.fetched_count} top hits loaded · ${wikiranLiveMeta.cached_new_count} newly saved offline)`
+                                : lang === 'fa'
+                                ? 'سرور زنده ویکی‌ایران در دسترس نیست (نمایش نتایج آفلاین محلی)'
+                                : 'Live WikIran server unreachable — showing 100% local offline SQLite matches'}
+                            </span>
+                          </div>
+                          {wikiranLiveMeta.search_url && (
+                            <a
+                              href={wikiranLiveMeta.search_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="px-3 py-1 text-xs font-bold text-indigo-900 bg-white hover:bg-indigo-100 border border-indigo-300 rounded-md inline-flex items-center gap-1.5 transition-colors"
+                            >
+                              <span>
+                                {lang === 'fa' ? 'مشاهده کل نتایج در WikIran.org' : 'Open Full Query on WikIran.org'}
+                              </span>
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          )}
+                        </div>
+
+                        {wikiranLiveMeta.online && wikiranLiveMeta.facets && wikiranLiveMeta.facets.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[11px] font-semibold text-indigo-900 me-1">
+                              {lang === 'fa' ? 'تفکیک مجموعه‌های افشا:' : 'Matched Leak Collections:'}
+                            </span>
+                            {activeLeakSourceFilter && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveLeakSourceFilter('');
+                                  runUniversalSearchWithQuery(searchQuery, { leakSource: '' });
+                                }}
+                                className="px-2 py-0.5 text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-300 rounded cursor-pointer hover:bg-rose-200"
+                              >
+                                × {lang === 'fa' ? 'همه لیک‌ها' : 'Clear Leak Filter'}
+                              </button>
+                            )}
+                            {wikiranLiveMeta.facets.slice(0, 12).map((facet) => {
+                              const isActive = activeLeakSourceFilter === facet.source;
+                              return (
+                                <button
+                                  key={facet.source}
+                                  type="button"
+                                  onClick={() => {
+                                    const nextLeak = isActive ? '' : facet.source;
+                                    setActiveLeakSourceFilter(nextLeak);
+                                    setSearchScopeTab('WIKIRAN');
+                                    runUniversalSearchWithQuery(searchQuery, { leakSource: nextLeak });
+                                  }}
+                                  className={`px-2 py-0.5 text-[11px] font-medium rounded border cursor-pointer transition-colors ${
+                                    isActive
+                                      ? 'bg-indigo-700 text-white border-indigo-700 font-bold'
+                                      : 'bg-white text-indigo-950 border-indigo-200 hover:bg-indigo-100'
+                                  }`}
+                                >
+                                  {facet.label}{' '}
+                                  <span className="font-mono-tabular font-bold ms-0.5">
+                                    ({facet.amount.toLocaleString()})
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                       <div className="px-4 sm:px-6 py-3 bg-indigo-50/70 border-b border-indigo-100 flex flex-wrap items-center justify-between gap-3 text-xs text-indigo-950 font-medium">
                         <div className="flex flex-wrap items-center gap-2.5">
                           <span>
                             {lang === 'fa'
-                              ? `تعداد نتایج نمایش‌داده‌شده (ویکی‌ایران + اوفک): ${scopedResults.length}`
-                              : `Showing ${scopedResults.length} matching records across WikIran + OFAC offline tables`}
+                              ? `تعداد نتایج نمایش‌داده‌شده (ویکی‌ایران + اوفک + OpenSanctions): ${scopedResults.length}`
+                              : `Showing ${scopedResults.length} matching records across WikIran + OFAC + OpenSanctions offline`}
                           </span>
                           {(filterDateFrom || filterDateTo) && (
                             <span className="px-2 py-0.5 text-[11px] font-mono-tabular font-semibold bg-amber-50 text-amber-800 border border-amber-300 rounded">
@@ -3091,7 +4038,7 @@ export default function App() {
                             </span>
                           )}
                           <span className="hidden md:inline font-mono-tabular text-[11px] text-indigo-700/80">
-                            fts_archive JOIN (ofac_entities, articles, publications, csv_row_content, file_metadata)
+                            fts_archive JOIN (ofac_entities, opensanctions_entities, articles, publications, csv_row_content)
                           </span>
                         </div>
                         <button
@@ -3190,9 +4137,27 @@ export default function App() {
                           <tbody className="divide-y divide-slate-200">
                             {scopedResults.map((row, idx) => {
                               const isOfac = row.record_type === 'OFAC_SANCTION';
+                              const isOs = row.record_type === 'OPENSANCTIONS';
+                              const isWikiranLive = row.record_type === 'WIKIRAN_LIVE';
+                              const isWikiranDoc = row.record_type === 'WIKIRAN_DOC';
+                              const wDocType = String((row as Record<string, unknown>).wikiran_doc_type || '');
+                              const wDocBadgeLabel =
+                                wDocType === 'FRONT_COMPANY'
+                                  ? 'Front Company'
+                                  : wDocType === 'VESSEL'
+                                  ? 'Vessel'
+                                  : wDocType === 'LEAKED_EMAIL'
+                                  ? 'Leaked Email'
+                                  : wDocType === 'LEAKED_FILE'
+                                  ? 'Leaked File'
+                                  : wDocType === 'LEAKED_CSV'
+                                  ? 'WikIran CSV'
+                                  : 'WikIran Doc';
                               const ofacList = String((row as Record<string, unknown>).ofac_list_source || 'SDN');
                               const ofacType = String((row as Record<string, unknown>).ofac_sdn_type || '');
                               const ofacEntNum = (row as Record<string, unknown>).ofac_ent_num;
+                              const osSchema = String((row as Record<string, unknown>).os_schema || '');
+                              const osId = String((row as Record<string, unknown>).os_id || '');
                               const ofacProgramsClean = String(
                                 (row as Record<string, unknown>).ofac_programs || ''
                               )
@@ -3223,6 +4188,12 @@ export default function App() {
                                   className={
                                     isOfac
                                       ? 'bg-rose-50/35 hover:bg-rose-50/70 transition-colors'
+                                      : isOs
+                                      ? 'bg-amber-50/35 hover:bg-amber-50/70 transition-colors'
+                                      : isWikiranLive
+                                      ? 'bg-indigo-50/35 hover:bg-indigo-50/70 transition-colors'
+                                      : isWikiranDoc
+                                      ? 'bg-sky-50/25 hover:bg-sky-50/60 transition-colors'
                                       : 'hover:bg-slate-50 transition-colors'
                                   }
                                 >
@@ -3237,6 +4208,39 @@ export default function App() {
                                           }`}
                                         >
                                           OFAC {ofacList}
+                                        </span>
+                                      )}
+                                      {isOs && (
+                                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-amber-600 text-white">
+                                          OpenSanctions
+                                        </span>
+                                      )}
+                                      {isWikiranLive && (
+                                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-indigo-700 text-white">
+                                          WikIran Live
+                                        </span>
+                                      )}
+                                      {(isWikiranLive || isWikiranDoc) && (
+                                        <span
+                                          className={`px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded ${
+                                            wDocType === 'FRONT_COMPANY'
+                                              ? 'bg-purple-700 text-white'
+                                              : wDocType === 'VESSEL'
+                                              ? 'bg-sky-700 text-white'
+                                              : 'bg-slate-700 text-white'
+                                          }`}
+                                        >
+                                          {wDocBadgeLabel}
+                                        </span>
+                                      )}
+                                      {isOs && osSchema && (
+                                        <span className="px-1.5 py-0.5 text-[10px] font-semibold uppercase bg-amber-100 text-amber-950 rounded">
+                                          {osSchema}
+                                        </span>
+                                      )}
+                                      {isOs && osId && (
+                                        <span className="text-[10px] font-mono-tabular text-slate-500">
+                                          {osId}
                                         </span>
                                       )}
                                       {isOfac && ofacType && (
@@ -3627,31 +4631,33 @@ export default function App() {
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <button
                       type="button"
-                      onClick={() => setWizardEntities(['ofac_iran', 'articles', 'publications'])}
+                      onClick={() =>
+                        setWizardEntities(['ofac_iran', 'opensanctions_iran', 'articles', 'publications'])
+                      }
                       className="px-3 py-1.5 text-xs font-semibold text-white bg-rose-700 hover:bg-rose-600 rounded-md transition-colors cursor-pointer"
                     >
-                      {lang === 'fa' ? 'پکیج تجاری (اوفک ایران + ویکی‌ایران)' : 'OFAC Iran + WikIran'}
+                      {lang === 'fa' ? 'پکیج کامل ایران (OFAC + OpenSanctions + ویکی‌ایران)' : 'Full Iran Bundle'}
                     </button>
                     <button
                       type="button"
-                      onClick={() => setWizardEntities(['ofac_iran'])}
+                      onClick={() => setWizardEntities(['ofac_iran', 'opensanctions_iran'])}
                       className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
                     >
-                      {lang === 'fa' ? 'فقط اوفک ایران' : 'OFAC Iran Only'}
+                      {lang === 'fa' ? 'فقط تحریم‌های ایران' : 'Iran Sanctions Only'}
                     </button>
                     <button
                       type="button"
                       onClick={() => setWizardEntities(['ofac_all'])}
                       className="px-3 py-1.5 text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
                     >
-                      {lang === 'fa' ? 'کل دیتاست اوفک' : 'Full OFAC (All)'}
+                      {lang === 'fa' ? 'کل دیتاست اوفک' : 'Full OFAC'}
                     </button>
                   </div>
                 </div>
 
                 <div className="p-5 sm:p-6 space-y-5 bg-slate-50/70">
-                  {/* Step 1: Select Worksheets Checkboxes (OFAC + WikIran) */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                  {/* Step 1: Select Worksheets Checkboxes (OFAC + OpenSanctions + WikIran) */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
                     {[
                       {
                         key: 'ofac_iran' as const,
@@ -3659,9 +4665,9 @@ export default function App() {
                         titleFa: 'تحریم‌های مرتبط با ایران اوفک (OFAC)',
                         count: data.ofac_summary?.iran_related_count ?? 0,
                         descEn:
-                          'All Iran-linked SDN & Consolidated entities (IRAN, IRGC, IFSR, EO13902, EO13846) with aliases & addresses',
+                          'All Iran-linked SDN & Consolidated entities (IRAN, IRGC, IFSR, EO13902, EO13846)',
                         descFa:
-                          'همه نهادها و افراد تحریمی مرتبط با ایران در اوفک (IRAN, IRGC, IFSR, EO13902) همراه با AKA و نشانی',
+                          'همه نهادها و افراد تحریمی مرتبط با ایران در اوفک همراه با AKA و نشانی',
                         borderColor: 'border-rose-500 bg-rose-50/70',
                         badgeColor: 'bg-rose-100 text-rose-900',
                       },
@@ -3671,11 +4677,32 @@ export default function App() {
                         titleFa: 'کل دیتاست جهانی اوفک (SDN + Consolidated)',
                         count: data.ofac_summary?.total_entities ?? 0,
                         descEn:
-                          'Complete U.S. Treasury SDN + Non-SDN Consolidated lists (all 8 lists, all active programs)',
-                        descFa:
-                          'تمامی ۸ لیست رسمی خزانه‌داری آمریکا (SDN + Non-SDN Consolidated) با تمام برنامه‌ها',
+                          'Complete U.S. Treasury SDN + Non-SDN Consolidated lists (all 8 lists)',
+                        descFa: 'تمامی ۸ لیست رسمی خزانه‌داری آمریکا با تمام برنامه‌ها',
                         borderColor: 'border-red-600 bg-red-50/60',
                         badgeColor: 'bg-red-100 text-red-900',
+                      },
+                      {
+                        key: 'opensanctions_iran' as const,
+                        titleEn: 'OpenSanctions Iran-Linked',
+                        titleFa: 'تحریم‌های ایران OpenSanctions (جهانی)',
+                        count: data.opensanctions_summary?.iran_related_count ?? 0,
+                        descEn:
+                          'Global UN, EU, UK OFSI, US, Canada & Australia Iran-linked sanctions targets',
+                        descFa: 'اهداف تحریمی مرتبط با ایران از سازمان ملل، اروپا، انگلستان و آمریکا',
+                        borderColor: 'border-amber-500 bg-amber-50/70',
+                        badgeColor: 'bg-amber-100 text-amber-950',
+                      },
+                      {
+                        key: 'opensanctions_all' as const,
+                        titleEn: 'OpenSanctions Global All',
+                        titleFa: 'کل دیتاست جهانی OpenSanctions',
+                        count: data.opensanctions_summary?.total_entities ?? 0,
+                        descEn:
+                          'Full consolidated global sanctions targets across all international lists',
+                        descFa: 'کل رکوردهای تجمیعی تحریم‌های بین‌المللی در OpenSanctions',
+                        borderColor: 'border-orange-500 bg-orange-50/60',
+                        badgeColor: 'bg-orange-100 text-orange-950',
                       },
                       {
                         key: 'articles' as const,
@@ -4633,41 +5660,259 @@ export default function App() {
             </div>
           )}
 
-          {/* 9. SETTINGS, WINDOWS INSTALLER (.EXE), STORAGE PATH & SCHEDULED COLLECTION PANEL */}
+          {/* 9. SETTINGS, FULL PORTABLE TEAM BACKUP, WINDOWS INSTALLER (.EXE), STORAGE PATH & SCHEDULER */}
           {activeNav === 'settings' && (
             <div className="space-y-6">
-              {/* WINDOWS INSTALLER (.EXE) & USER-CONFIGURABLE STORAGE PATH */}
-              <section className="bg-white border-2 border-indigo-300 rounded-xl overflow-hidden shadow-xs">
-                <div className="bg-slate-900 text-white px-5 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800">
+              {/* REAL FULL PORTABLE BACKUP & RESTORE FOR ALL 5 TEAM PCS */}
+              <section className="bg-white border-2 border-emerald-400 rounded-xl overflow-hidden shadow-md">
+                <div className="bg-emerald-950 text-white px-5 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-emerald-800">
                   <div className="space-y-1">
-                    <div className="text-xs font-bold text-sky-400 uppercase tracking-wider">
+                    <div className="text-xs font-bold text-emerald-300 uppercase tracking-wider">
                       {lang === 'fa'
-                        ? 'نصب‌کننده هوشمند ویندوز (.EXE) به همراه بررسی و نصب خودکار پایتون و پیش‌نیازها'
-                        : 'STEP-BY-STEP WINDOWS INSTALLER (.EXE) WITH AUTOMATIC PYTHON & PREREQUISITE SETUP'}
+                        ? 'بکاپ کامل و قابل انتقال برای هر ۵ کامپیوتر تیم (بدون نیاز به دانلود مجدد)'
+                        : 'FULL PORTABLE TEAM BACKUP & RESTORE (SHARE ACROSS ALL 5 PCS — ZERO RE-DOWNLOAD)'}
                     </div>
                     <h3 className="text-base sm:text-lg font-bold text-white">
                       {lang === 'fa'
-                        ? 'دانلود فایل نصب ویندوز (WikIranArchive_Setup.exe) — نصب گام‌به‌گام پیش‌نیازها و برنامه'
-                        : 'WikIran Archive Windows Setup (WikIranArchive_Setup.exe) & Data Storage Directory'}
+                        ? 'پشتیبان‌گیری کامل از کل برنامه و داده‌ها (.ZIP) و بازیابی روی سیستم‌های دیگر'
+                        : 'Full Archive Backup Package (.ZIP) — Everything Offline in One File'}
+                    </h3>
+                    <p className="text-xs text-emerald-100/90 max-w-3xl">
+                      {lang === 'fa'
+                        ? 'این بکاپ شامل تمام دیتابیس SQLite + ایندکس جستجو (کل ویکی‌ایران + ۲۰٬۰۸۵ رکورد OFAC + کل OpenSanctions + جداول CSV + تنظیمات) به‌علاوه فایل‌های خام CSV و کد امنیتی SHA-256 است. کافیست روی ۱ سیستم دانلود کنید و این فایل .ZIP را روی ۴ سیستم دیگر بازیابی کنید.'
+                        : 'Packages the entire consistent SQLite database + FTS5 search index (all WikIran articles/leaks + all OFAC SDN/Consolidated + all OpenSanctions global targets + CSV workbench + crawl frontier + settings) plus raw OFAC/OpenSanctions CSVs and SHA-256 manifest into one portable .ZIP.'}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                    <button
+                      type="button"
+                      disabled={chunkDownloadProgress !== null}
+                      onClick={() =>
+                        downloadChunkedZip(
+                          '/api/backup/full-prepare',
+                          '/api/backup/full-chunk',
+                          {},
+                          lang === 'fa' ? 'دانلود بکاپ کامل' : 'Full Backup Download'
+                        )
+                      }
+                      className="px-5 py-2.5 text-xs sm:text-sm font-bold text-emerald-950 bg-emerald-300 hover:bg-emerald-200 disabled:opacity-60 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs cursor-pointer"
+                    >
+                      <HardDriveDownload className="w-4 h-4 shrink-0" />
+                      <span>
+                        {lang === 'fa'
+                          ? 'دانلود بکاپ کامل همه داده‌ها (.ZIP)'
+                          : 'Download Full Backup (.ZIP)'}
+                      </span>
+                    </button>
+                    <label className="px-4 py-2.5 text-xs sm:text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-500 border border-indigo-400 rounded-lg transition-colors inline-flex items-center gap-2 cursor-pointer shadow-xs">
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span>
+                        {busyAction === 'full_restore'
+                          ? lang === 'fa'
+                            ? 'در حال بازیابی بکاپ...'
+                            : 'Restoring Full Backup...'
+                          : lang === 'fa'
+                          ? 'بازیابی فایل بکاپ (.ZIP) روی این سیستم'
+                          : 'Restore Full Backup (.ZIP)'}
+                      </span>
+                      <input
+                        type="file"
+                        accept=".zip,.db"
+                        onChange={handleFullBackupRestoreUpload}
+                        disabled={busyAction !== null}
+                        className="hidden"
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="p-5 sm:p-6 bg-emerald-50/35 space-y-4">
+                  {fullBackupMsg && (
+                    <div className="px-4 py-2.5 rounded-lg bg-emerald-100 border border-emerald-300 text-xs font-semibold text-emerald-950 flex items-center justify-between gap-2">
+                      <span>{fullBackupMsg}</span>
+                      <button
+                        type="button"
+                        onClick={() => setFullBackupMsg(null)}
+                        className="text-emerald-800 hover:text-emerald-950 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                    <div className="bg-white border border-emerald-200 rounded-lg p-3">
+                      <div className="text-slate-500">
+                        {lang === 'fa' ? 'آرشیو ویکی‌ایران' : 'WikIran Records'}
+                      </div>
+                      <div className="text-lg font-bold font-mono-tabular text-slate-900 mt-0.5">
+                        {(data.stats.articles_count + data.stats.publications_count).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-emerald-200 rounded-lg p-3">
+                      <div className="text-slate-500">
+                        {lang === 'fa' ? 'تحریم‌های اوفک' : 'OFAC Entities'}
+                      </div>
+                      <div className="text-lg font-bold font-mono-tabular text-rose-700 mt-0.5">
+                        {(data.ofac_summary?.total_entities ?? 0).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-emerald-200 rounded-lg p-3">
+                      <div className="text-slate-500">
+                        {lang === 'fa' ? 'تحریم‌های OpenSanctions' : 'OpenSanctions Targets'}
+                      </div>
+                      <div className="text-lg font-bold font-mono-tabular text-amber-700 mt-0.5">
+                        {(data.opensanctions_summary?.total_entities ?? 0).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="bg-white border border-emerald-200 rounded-lg p-3">
+                      <div className="text-slate-500">
+                        {lang === 'fa' ? 'حجم فعلی دیتابیس' : 'Current DB Size'}
+                      </div>
+                      <div className="text-lg font-bold font-mono-tabular text-emerald-700 mt-0.5">
+                        {data.storage_volume?.db_size_label || '—'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {data.backups && data.backups.length > 0 && (
+                    <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                      <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-xs font-bold text-slate-700">
+                        <span>
+                          {lang === 'fa'
+                            ? `بکاپ‌های ذخیره‌شده روی این سیستم (${data.backups.length})`
+                            : `Saved Local Backups (${data.backups.length})`}
+                        </span>
+                        <span className="font-mono-tabular text-[11px] text-slate-500">
+                          {data.paths.backups_dir}
+                        </span>
+                      </div>
+                      <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto">
+                        {data.backups.slice(0, 6).map((b) => (
+                          <div
+                            key={b.path}
+                            className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-mono-tabular font-semibold text-slate-900 truncate">
+                                {b.filename}
+                              </div>
+                              <div className="text-[11px] text-slate-500 font-mono-tabular">
+                                {(b.size_bytes / (1024 * 1024)).toFixed(2)} MB · {b.created_at}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              {b.filename.endsWith('.zip') && (
+                                <button
+                                  type="button"
+                                  disabled={chunkDownloadProgress !== null}
+                                  onClick={() =>
+                                    downloadChunkedZip(
+                                      '/api/backup/full-prepare',
+                                      '/api/backup/full-chunk',
+                                      { path: b.path },
+                                      b.filename
+                                    )
+                                  }
+                                  className="px-2.5 py-1 text-[11px] font-bold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded cursor-pointer"
+                                >
+                                  {lang === 'fa' ? 'دانلود ZIP' : 'Download ZIP'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleConfirmRestore(b.path)}
+                                disabled={busyAction !== null}
+                                className="px-2.5 py-1 text-[11px] font-bold text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded cursor-pointer"
+                              >
+                                {lang === 'fa' ? 'بازیابی' : 'Restore'}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              {/* WINDOWS PORTABLE EDITION (.ZIP — ZERO .EXE) & USER-CONFIGURABLE STORAGE PATH */}
+              <section className="bg-white border-2 border-emerald-400 rounded-xl overflow-hidden shadow-xs">
+                <div className="bg-slate-900 text-white px-5 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800">
+                  <div className="space-y-1">
+                    <div className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
+                      {lang === 'fa'
+                        ? 'نسخه پرتابل ویندوز (.ZIP) — بدون فایل .EXE، بدون هشدار امنیتی ویندوز، بدون نیاز به نصب'
+                        : 'WINDOWS PORTABLE EDITION (.ZIP) — ZERO .EXE FILES, NO WINDOWS SECURITY BLOCK, NO INSTALLATION'}
+                    </div>
+                    <h3 className="text-base sm:text-lg font-bold text-white">
+                      {lang === 'fa'
+                        ? 'دانلود نسخه کامل و پرتابل ویندوز (WikIranArchive_Portable_Windows.zip)'
+                        : 'WikIran Archive Portable Edition (WikIranArchive_Portable_Windows.zip)'}
                     </h3>
                     <p className="text-xs text-slate-300 max-w-3xl">
                       {lang === 'fa'
-                        ? 'فایل WikIranArchive_Setup.exe ابتدا سیستم را بررسی می‌کند؛ اگر پایتون ۳.۱۱ یا پیش‌نیازها نصب نباشند، به‌طور خودکار آن‌ها را دانلود و نصب می‌کند و سپس برنامه، دیتابیس SQLite و میانبر دسکتاپ را در مسیر دلخواه شما نصب می‌نماید.'
-                        : 'WikIranArchive_Setup.exe checks your PC first: if Python 3.11 or any required component is missing, the installer automatically downloads and installs them step-by-step, then installs WikIran Archive, the SQLite database, and the Desktop shortcut.'}
+                        ? 'بسته کامل و آماده اجرای ویندوز شامل کل برنامه، رابط کاربری، موتور پایتون، تمام ۹۷٬۳۰۰+ رکورد آفلاین (OFAC + OpenSanctions + WikIran) و تنها چند فایل ساده .bat — بدون هیچ فایل .exe و بدون هیچ هشدار Windows Defender یا SmartScreen. کافی است از حالت فشرده خارج کنید و اجرا نمایید!'
+                        : 'Self-contained portable bundle with the full app, compiled UI, Python engine, all offline OFAC + OpenSanctions + WikIran records, and simple .bat launchers — zero .exe files, zero Windows Defender/SmartScreen warnings, and no installation wizard. Just unzip anywhere and run!'}
                     </p>
                   </div>
-                  <a
-                    href="/api/download/windows-installer-exe"
-                    className="px-5 py-2.5 text-xs sm:text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs shrink-0"
-                  >
-                    <HardDriveDownload className="w-4 h-4 shrink-0" />
-                    <span>
-                      {lang === 'fa'
-                        ? 'دانلود نصب‌کننده ویندوز (WikIranArchive_Setup.exe)'
-                        : 'Download Windows Installer (WikIranArchive_Setup.exe)'}
-                    </span>
-                  </a>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={chunkDownloadProgress !== null}
+                      onClick={() =>
+                        downloadChunkedZip(
+                          '/api/download/windows-portable-prepare',
+                          '/api/download/windows-portable-chunk',
+                          {},
+                          lang === 'fa'
+                            ? 'دانلود نسخه کامل پرتابل (با دیتابیس)'
+                            : 'Full Portable Edition (With DB)'
+                        )
+                      }
+                      className="px-4 py-2.5 text-xs sm:text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs cursor-pointer"
+                    >
+                      <HardDriveDownload className="w-4 h-4 shrink-0" />
+                      <span>
+                        {lang === 'fa'
+                          ? 'دانلود نسخه کامل با دیتابیس (~72 MB)'
+                          : 'Download Full Portable (~72 MB, Pre-Loaded DB)'}
+                      </span>
+                    </button>
+                    <a
+                      href="/api/download/windows-portable-lite-zip"
+                      download="WikIranArchive_Portable_Windows_Release.zip"
+                      className="px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-900 bg-sky-300 hover:bg-sky-200 rounded-lg transition-colors inline-flex items-center gap-2 shadow-xs"
+                    >
+                      <Download className="w-4 h-4 shrink-0" />
+                      <span>
+                        {lang === 'fa'
+                          ? 'دانلود سریع نسخه ویندوز (~1 MB)'
+                          : 'Fast Windows Release (~1 MB Direct Link)'}
+                      </span>
+                    </a>
+                  </div>
                 </div>
+
+                {chunkDownloadProgress && (
+                  <div className="px-5 sm:px-6 py-3.5 bg-emerald-950 text-emerald-100 border-b border-emerald-800 space-y-2">
+                    <div className="flex items-center justify-between gap-2 text-xs font-bold">
+                      <span className="inline-flex items-center gap-2">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                        <span>{chunkDownloadProgress.label}</span>
+                      </span>
+                      <span className="font-mono-tabular text-emerald-300">
+                        {chunkDownloadProgress.loadedMb} / {chunkDownloadProgress.totalMb} MB ({chunkDownloadProgress.percent}%)
+                      </span>
+                    </div>
+                    <div className="w-full h-2 bg-emerald-900 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-400 rounded-full transition-all duration-200"
+                        style={{ width: `${chunkDownloadProgress.percent}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
 
                 <div className="p-5 sm:p-6 grid grid-cols-1 lg:grid-cols-2 gap-6 bg-slate-50/60">
                   {/* Left Column: User-Selectable Storage Path */}
@@ -4691,8 +5936,8 @@ export default function App() {
                       </h4>
                       <p className="text-xs text-slate-600 leading-relaxed">
                         {lang === 'fa'
-                          ? 'مسیر دلخواه خود را روی ویندوز وارد یا انتخاب کنید. هم در زمان نصب فایل .exe و هم در اینجا می‌توانید مشخص کنید تمام اطلاعات در کدام پوشه یا درایو ذخیره شوند.'
-                          : 'Specify the folder on your computer where all downloaded articles, publications, SQLite database files, Excel exports, and backups should be stored. You can also choose this folder inside the .exe installer wizard.'}
+                          ? 'در نسخه پرتابل (.zip) تمام اطلاعات به‌طور خودکار داخل پوشه data کنار برنامه ذخیره می‌شوند و می‌توانید کل پوشه را با فلش به هر ۵ کامپیوتر منتقل کنید. همچنین در اینجا می‌توانید مسیر دلخواه دیگری روی ویندوز تنظیم کنید.'
+                          : 'In the Portable Edition (.zip), all data is stored self-contained inside the extracted folder’s own data/ directory so you can copy the entire folder via USB to all 5 office PCs. You can also set a custom storage path below.'}
                       </p>
 
                       <div className="space-y-2 pt-1">
@@ -4747,66 +5992,115 @@ export default function App() {
                     </div>
                   </form>
 
-                  {/* Right Column: One-File Windows Installer (.exe) Step-by-Step Prerequisite & App Installer */}
+                  {/* Right Column: Portable .ZIP Step-by-Step Guide & Bundled .BAT Files */}
                   <div className="bg-white border border-emerald-200 rounded-xl p-5 flex flex-col justify-between space-y-4">
                     <div className="space-y-3">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-bold uppercase tracking-wider px-2.5 py-0.5 rounded bg-emerald-100 text-emerald-950">
                           {lang === 'fa'
-                            ? 'نصب خودکار پایتون، کتابخانه‌ها و برنامه'
-                            : 'ALL-IN-ONE PREREQUISITE + APP INSTALLER (.EXE)'}
+                            ? 'بدون فایل .EXE • فقط فایل‌های .BAT شفاف'
+                            : 'ZERO .EXE • CLEAN .BAT PORTABLE BUNDLE'}
                         </span>
                         <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
                       </div>
                       <h4 className="text-sm sm:text-base font-bold text-slate-900">
                         {lang === 'fa'
-                          ? 'مراحل خودکار داخل WikIranArchive_Setup.exe (بدون نیاز به هیچ دستور دستی)'
-                          : 'What WikIranArchive_Setup.exe Does Step-by-Step Automatically'}
+                          ? 'نحوه اجرا در ۳ گام ساده (مناسب برای هر ۵ کامپیوتر بدون دانلود مجدد)'
+                          : 'How to Run in 3 Simple Steps (Copy Folder to All 5 PCs — Zero Re-Download)'}
                       </h4>
-                      <ol className="list-decimal list-inside space-y-1.5 text-xs text-slate-700 leading-relaxed">
+                      <ol className="list-decimal list-inside space-y-2 text-xs text-slate-700 leading-relaxed">
                         <li>
-                          {lang === 'fa'
-                            ? 'گام ۱ (بررسی سیستم): نصب‌کننده ابتدا کامپیوتر ویندوزی را بررسی می‌کند که آیا Python 3.11+، کتابخانه‌های مورد نیاز و WebView2 نصب هستند یا خیر.'
-                            : 'Step 1 (System Check): Inspects the PC to check if Python 3.11+, required packages, and Edge WebView2 Runtime are installed.'}
+                          {lang === 'fa' ? (
+                            <>
+                              <strong className="text-slate-900">استخراج فایل ZIP:</strong> فایل{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">WikIranArchive_Portable_Windows.zip</code>{' '}
+                              را در هر مسیری (مثلاً <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">C:\WikIranArchive</code> یا فلش USB) از حالت فشرده خارج کنید. هیچ فایل <code className="font-mono-tabular">.exe</code> داخل آن نیست.
+                            </>
+                          ) : (
+                            <>
+                              <strong className="text-slate-900">Unzip Anywhere:</strong> Extract{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">WikIranArchive_Portable_Windows.zip</code>{' '}
+                              to any folder (e.g. <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">C:\WikIranArchive</code> or USB drive). Contains zero <code className="font-mono-tabular">.exe</code> files and needs no Node.js.
+                            </>
+                          )}
                         </li>
                         <li>
-                          {lang === 'fa'
-                            ? 'گام ۲ (نصب خودکار پیش‌نیازها): اگر پایتون یا کتابخانه‌ای روی سیستم نباشد، نصب‌کننده به‌طور خودکار فایل نصبی رسمی Python 3.11 (64-bit) و پکیج‌ها (requirements.txt) را دانلود و بی‌صدا نصب می‌کند.'
-                            : 'Step 2 (Auto-Install Python & Packages): If Python or packages are missing, the installer automatically downloads and silently installs Python 3.11.9 (64-bit) and runs pip install -r requirements.txt.'}
+                          {lang === 'fa' ? (
+                            <>
+                              <strong className="text-slate-900">فقط بار اول — <code className="px-1 py-0.5 bg-emerald-50 text-emerald-900 rounded font-mono-tabular">1_Install_Prerequisites.bat</code>:</strong>{' '}
+                              وجود Python 3.11+ را بررسی می‌کند (در صورت نبودن، نسخه رسمی و امضاشده پایتون را از طریق <code className="font-mono-tabular">winget</code> نصب می‌کند) و تنها کتابخانه سبک <code className="font-mono-tabular">openpyxl</code> را برای خروجی اکسل نصب می‌نماید.
+                            </>
+                          ) : (
+                            <>
+                              <strong className="text-slate-900">First Time Only — <code className="px-1 py-0.5 bg-emerald-50 text-emerald-900 rounded font-mono-tabular">1_Install_Prerequisites.bat</code>:</strong>{' '}
+                              Checks for Python 3.11+ (auto-installs official signed Python via <code className="font-mono-tabular">winget</code> if missing) and installs the tiny <code className="font-mono-tabular">openpyxl</code> Excel helper.
+                            </>
+                          )}
                         </li>
                         <li>
-                          {lang === 'fa'
-                            ? 'گام ۳ (نصب برنامه و دیتابیس): فایل اجرایی WikIranArchive.exe، موتور کامل پایتون، دیتابیس SQLite و گزارش‌های اکسل را در مسیر ذخیره‌سازی انتخابی شما نصب کرده و میانبر دسکتاپ را می‌سازد.'
-                            : 'Step 3 (Install App & Database): Installs WikIranArchive.exe, the full Python package, SQLite FTS5 database, and Excel exports into your chosen Storage Path and creates the Desktop shortcut.'}
+                          {lang === 'fa' ? (
+                            <>
+                              <strong className="text-slate-900">اجرای روزانه — <code className="px-1 py-0.5 bg-emerald-50 text-emerald-900 rounded font-mono-tabular">2_Start_WikIran_Archive.bat</code>:</strong>{' '}
+                              سرور محلی پایتون را با دیتابیس کامل داخل همین پوشه اجرا کرده و برنامه را در پنجره اختصاصی Edge باز می‌کند.
+                            </>
+                          ) : (
+                            <>
+                              <strong className="text-slate-900">Daily Launch — <code className="px-1 py-0.5 bg-emerald-50 text-emerald-900 rounded font-mono-tabular">2_Start_WikIran_Archive.bat</code>:</strong>{' '}
+                              Starts the pure-Python local server using the pre-loaded offline database inside the folder and opens the app in a clean Edge desktop window.
+                            </>
+                          )}
                         </li>
                         <li>
-                          {lang === 'fa'
-                            ? 'گام ۴ (اجرای برنامه): برنامه WikIran Archive به‌طور خودکار باز می‌شود.'
-                            : 'Step 4 (Launch): Automatically launches WikIran Archive ready for use.'}
+                          {lang === 'fa' ? (
+                            <>
+                              <strong className="text-slate-900">ابزارهای اختیاری داخل بسته:</strong>{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">Create_Desktop_Shortcut.bat</code> (ساخت میانبر دسکتاپ) و{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">3_Stop_WikIran_Archive.bat</code> (توقف ایمن سرور).
+                            </>
+                          ) : (
+                            <>
+                              <strong className="text-slate-900">Included Helpers:</strong>{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">Create_Desktop_Shortcut.bat</code> (optional Desktop shortcut) &amp;{' '}
+                              <code className="px-1 py-0.5 bg-slate-100 rounded font-mono-tabular">3_Stop_WikIran_Archive.bat</code> (graceful stop).
+                            </>
+                          )}
                         </li>
                       </ol>
                     </div>
 
-                    <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
-                      <a
-                        href="/api/download/windows-installer-exe"
-                        className="flex-1 py-2.5 px-4 text-xs sm:text-sm font-bold text-center text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors inline-flex items-center justify-center gap-2 shadow-xs"
+                    <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center gap-2.5">
+                      <button
+                        type="button"
+                        disabled={chunkDownloadProgress !== null}
+                        onClick={() =>
+                          downloadChunkedZip(
+                            '/api/download/windows-portable-prepare',
+                            '/api/download/windows-portable-chunk',
+                            {},
+                            lang === 'fa'
+                              ? 'دانلود نسخه کامل پرتابل (با دیتابیس)'
+                              : 'Full Portable Edition (With DB)'
+                          )
+                        }
+                        className="flex-1 py-2.5 px-4 text-xs sm:text-sm font-bold text-center text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 rounded-lg transition-colors inline-flex items-center justify-center gap-2 shadow-xs cursor-pointer"
                       >
                         <HardDriveDownload className="w-4 h-4 shrink-0" />
                         <span>
                           {lang === 'fa'
-                            ? 'دانلود WikIranArchive_Setup.exe'
-                            : 'Download WikIranArchive_Setup.exe'}
+                            ? 'دانلود نسخه کامل با دیتابیس (~72 MB)'
+                            : 'Full Portable ZIP (~72 MB w/ DB)'}
                         </span>
-                      </a>
+                      </button>
                       <a
-                        href="/api/download/windows-package"
-                        className="py-2.5 px-3.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-lg transition-colors inline-flex items-center gap-1.5"
+                        href="/api/download/windows-portable-lite-zip"
+                        download="WikIranArchive_Portable_Windows_Release.zip"
+                        className="py-2.5 px-4 text-xs sm:text-sm font-bold text-center text-slate-900 bg-sky-100 hover:bg-sky-200 border border-sky-300 rounded-lg transition-colors inline-flex items-center justify-center gap-2"
                       >
+                        <Download className="w-4 h-4 shrink-0" />
                         <span>
                           {lang === 'fa'
-                            ? 'اسکریپت‌های Inno Setup (.iss) و ZIP'
-                            : 'Inno Setup (.iss) & Build Kit (.zip)'}
+                            ? 'نسخه سبک (~1 MB)'
+                            : 'Fast Release (~1 MB)'}
                         </span>
                       </a>
                     </div>

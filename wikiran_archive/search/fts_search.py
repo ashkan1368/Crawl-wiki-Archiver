@@ -46,12 +46,16 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_title, 'Archive File') || ' — ' || file_metadata.data_type
             WHEN fts_archive.record_type = 'ENTITY' THEN o.name || ' (' || COALESCE(NULLIF(o.acronym, ''), o.org_type) || ')'
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN ofac.sdn_name
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN os_ent.name
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN wdoc.title
             ELSE fts_archive.title
         END AS title,
         CASE
             WHEN fts_archive.record_type = 'PUBLICATION' THEN COALESCE(p.native_title, '')
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(o.native_name, '')
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(ofac.aliases_text, '')
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN COALESCE(os_ent.aliases, '')
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN COALESCE(wdoc.identifier_or_imo, '')
             ELSE ''
         END AS native_title,
         CASE
@@ -64,6 +68,11 @@ WITH unified_joined_records AS (
                 'OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.sdn_type, ''), 'entity') || ')'
                 || CASE WHEN ofac.programs != '' THEN ' · Programs: ' || ofac.programs ELSE '' END
                 || CASE WHEN ofac.countries_text != '' THEN ' · Countries: ' || ofac.countries_text ELSE '' END
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN
+                'OpenSanctions ' || COALESCE(NULLIF(os_ent.schema_type, ''), 'Entity')
+                || CASE WHEN os_ent.countries != '' THEN ' · Countries: ' || os_ent.countries ELSE '' END
+                || CASE WHEN os_ent.datasets != '' THEN ' · Lists: ' || os_ent.datasets ELSE '' END
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN COALESCE(NULLIF(wdoc.snippet, ''), wdoc.title)
             ELSE fts_archive.summary
         END AS short_description,
         CASE
@@ -78,6 +87,23 @@ WITH unified_joined_records AS (
                     || CASE WHEN ofac.addresses_text != '' THEN 'Addresses: ' || ofac.addresses_text || char(10) ELSE '' END
                     || CASE WHEN ofac.remarks != '' THEN 'Remarks: ' || ofac.remarks ELSE '' END
                 )
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN
+                TRIM(
+                    CASE WHEN os_ent.aliases != '' THEN 'Aliases: ' || os_ent.aliases || char(10) ELSE '' END
+                    || CASE WHEN os_ent.identifiers != '' THEN 'Identifiers: ' || os_ent.identifiers || char(10) ELSE '' END
+                    || CASE WHEN os_ent.addresses != '' THEN 'Addresses: ' || os_ent.addresses || char(10) ELSE '' END
+                    || CASE WHEN os_ent.sanctions != '' THEN 'Sanctions Details: ' || os_ent.sanctions || char(10) ELSE '' END
+                    || CASE WHEN os_ent.program_ids != '' THEN 'Programs: ' || os_ent.program_ids ELSE '' END
+                )
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN
+                TRIM(
+                    'Document Type: ' || wdoc.doc_type || char(10)
+                    || CASE WHEN wdoc.leak_sources != '' THEN 'Source Leak: ' || wdoc.leak_sources || char(10) ELSE '' END
+                    || CASE WHEN wdoc.country_or_flag != '' THEN 'Jurisdiction / Flag: ' || wdoc.country_or_flag || char(10) ELSE '' END
+                    || CASE WHEN wdoc.bank_or_operator != '' THEN 'Bank / Operator: ' || wdoc.bank_or_operator || char(10) ELSE '' END
+                    || CASE WHEN wdoc.identifier_or_imo != '' THEN 'Account / IMO / Ref: ' || wdoc.identifier_or_imo || char(10) ELSE '' END
+                    || 'Details: ' || wdoc.snippet
+                )
             ELSE fts_archive.editorial_content
         END AS editorial_content,
         CASE
@@ -87,6 +113,8 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_date, SUBSTR(file_metadata.retrieved_at, 1, 10))
             WHEN fts_archive.record_type = 'ENTITY' THEN SUBSTR(o.retrieved_at, 1, 10)
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(NULLIF(ofac.date_published, ''), SUBSTR(ofac.retrieved_at, 1, 10))
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN SUBSTR(COALESCE(NULLIF(os_ent.last_change, ''), NULLIF(os_ent.last_seen, ''), os_ent.retrieved_at), 1, 10)
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN COALESCE(NULLIF(wdoc.document_date, ''), SUBSTR(wdoc.retrieved_at, 1, 10))
             ELSE fts_archive.publication_date
         END AS publication_date,
         CASE
@@ -106,6 +134,8 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN 'File & Document Inventory'
             WHEN fts_archive.record_type = 'ENTITY' THEN 'Organization / ' || o.org_type
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.programs, ''), 'SANCTIONS') || ')'
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN 'OpenSanctions ' || COALESCE(NULLIF(os_ent.schema_type, ''), 'Entity') || ' (' || COALESCE(NULLIF(os_ent.datasets, ''), 'sanctions') || ')'
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN 'WikIran ' || REPLACE(wdoc.doc_type, '_', ' ') || CASE WHEN wdoc.leak_sources != '' THEN ' (' || wdoc.leak_sources || ')' ELSE '' END
             ELSE 'General Research'
         END AS category_en,
         CASE
@@ -125,6 +155,8 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN 'فهرست فایل‌ها و اسناد'
             WHEN fts_archive.record_type = 'ENTITY' THEN 'سازمان و نهاد (' || COALESCE(NULLIF(o.native_name, ''), o.org_type) || ')'
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'تحریم اوفک OFAC ' || ofac.list_source || ' (' || COALESCE(NULLIF(ofac.programs, ''), 'تحریم') || ')'
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN 'تحریم جهانی OpenSanctions (' || COALESCE(NULLIF(os_ent.datasets, ''), 'sanctions') || ')'
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN 'آرشیو ویکی‌ایران (' || COALESCE(NULLIF(wdoc.leak_sources, ''), wdoc.doc_type) || ')'
             ELSE 'پژوهش عمومی'
         END AS category_fa,
         CASE
@@ -151,6 +183,13 @@ WITH unified_joined_records AS (
             ), '')
             WHEN fts_archive.record_type = 'ENTITY' THEN o.name
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN COALESCE(NULLIF(ofac.countries_text, ''), ofac.sdn_type)
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN COALESCE(NULLIF(os_ent.countries, ''), os_ent.schema_type)
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN
+                TRIM(
+                    COALESCE(wdoc.bank_or_operator, '')
+                    || CASE WHEN wdoc.bank_or_operator != '' AND wdoc.country_or_flag != '' THEN ' · ' ELSE '' END
+                    || COALESCE(wdoc.country_or_flag, '')
+                )
             ELSE ''
         END AS organizations,
         CASE
@@ -165,6 +204,8 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN file_metadata.data_type
             WHEN fts_archive.record_type = 'ENTITY' THEN COALESCE(NULLIF(o.acronym, ''), o.org_type)
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN ofac.programs
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN COALESCE(NULLIF(os_ent.program_ids, ''), os_ent.datasets)
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN COALESCE(NULLIF(wdoc.leak_sources, ''), wdoc.doc_type)
             ELSE fts_archive.tag_names
         END AS tags,
         CASE
@@ -174,6 +215,8 @@ WITH unified_joined_records AS (
             WHEN fts_archive.record_type = 'FILE_INVENTORY' THEN COALESCE(file_metadata.publication_title, 'File Inventory')
             WHEN fts_archive.record_type = 'ENTITY' THEN 'WikIran Organizations & Entities'
             WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'U.S. Treasury OFAC ' || ofac.list_source || ' List'
+            WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN 'OpenSanctions Global (' || COALESCE(NULLIF(os_ent.schema_type, ''), 'Sanctions') || ')'
+            WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN 'WikIran Archive — ' || COALESCE(NULLIF(wdoc.leak_sources, ''), wdoc.doc_type)
             ELSE 'WikIran Archive'
         END AS source_name,
         COALESCE(
@@ -183,6 +226,8 @@ WITH unified_joined_records AS (
             file_metadata.source_url,
             o.source_url,
             ofac.source_url,
+            os_ent.source_url,
+            wdoc.source_url,
             fts_archive.source_url
         ) AS source_url,
         COALESCE(
@@ -192,6 +237,8 @@ WITH unified_joined_records AS (
             file_metadata.extraction_status,
             o.extraction_status,
             CASE WHEN fts_archive.record_type = 'OFAC_SANCTION' THEN 'OFAC_DESIGNATED' ELSE NULL END,
+            CASE WHEN fts_archive.record_type = 'OPENSANCTIONS' THEN 'OPENSANCTIONS_LISTED' ELSE NULL END,
+            CASE WHEN fts_archive.record_type = 'WIKIRAN_DOC' THEN 'WIKIRAN_ARCHIVED' ELSE NULL END,
             'VERIFIED'
         ) AS extraction_status,
         COALESCE(
@@ -201,6 +248,8 @@ WITH unified_joined_records AS (
             file_metadata.retrieved_at,
             o.retrieved_at,
             ofac.retrieved_at,
+            os_ent.retrieved_at,
+            wdoc.retrieved_at,
             ''
         ) AS retrieved_at,
         COALESCE(
@@ -217,7 +266,12 @@ WITH unified_joined_records AS (
         COALESCE(ofac.programs, '') AS ofac_programs,
         COALESCE(ofac.aliases_text, '') AS ofac_aliases,
         COALESCE(ofac.addresses_text, '') AS ofac_addresses,
-        COALESCE(ofac.countries_text, '') AS ofac_countries
+        COALESCE(ofac.countries_text, '') AS ofac_countries,
+        COALESCE(os_ent.os_id, '') AS os_id,
+        COALESCE(os_ent.schema_type, '') AS os_schema,
+        COALESCE(os_ent.datasets, '') AS os_datasets,
+        COALESCE(os_ent.identifiers, '') AS os_identifiers,
+        COALESCE(wdoc.doc_type, '') AS wikiran_doc_type
     FROM fts_archive
     LEFT JOIN articles a
         ON fts_archive.record_type = 'ARTICLE' AND a.id = CAST(fts_archive.record_id AS INTEGER)
@@ -235,6 +289,10 @@ WITH unified_joined_records AS (
         ON fts_archive.record_type = 'ENTITY' AND o.id = CAST(fts_archive.record_id AS INTEGER)
     LEFT JOIN ofac_entities ofac
         ON fts_archive.record_type = 'OFAC_SANCTION' AND ofac.id = CAST(fts_archive.record_id AS INTEGER)
+    LEFT JOIN opensanctions_entities os_ent
+        ON fts_archive.record_type = 'OPENSANCTIONS' AND os_ent.id = CAST(fts_archive.record_id AS INTEGER)
+    LEFT JOIN wikiran_documents wdoc
+        ON fts_archive.record_type = 'WIKIRAN_DOC' AND wdoc.id = CAST(fts_archive.record_id AS INTEGER)
     WHERE {fts_where_clause}
       AND (
           :source_type IS NULL
@@ -286,7 +344,11 @@ WHERE title IS NOT NULL
       OR LOWER(organizations) LIKE '%' || LOWER(:organization_name) || '%'
   )
 ORDER BY
-    CASE WHEN record_type = 'OFAC_SANCTION' THEN 0 ELSE 1 END ASC,
+    CASE
+        WHEN record_type = 'OFAC_SANCTION' THEN 0
+        WHEN record_type = 'OPENSANCTIONS' THEN 1
+        ELSE 2
+    END ASC,
     fts_rank ASC,
     publication_date DESC,
     id DESC
@@ -474,6 +536,11 @@ class ArchiveSearchEngine:
                     "ofac_aliases": row["ofac_aliases"] or "",
                     "ofac_addresses": row["ofac_addresses"] or "",
                     "ofac_countries": row["ofac_countries"] or "",
+                    "os_id": row["os_id"] or "",
+                    "os_schema": row["os_schema"] or "",
+                    "os_datasets": row["os_datasets"] or "",
+                    "os_identifiers": row["os_identifiers"] or "",
+                    "wikiran_doc_type": row["wikiran_doc_type"] or "",
                 }
             )
         return results

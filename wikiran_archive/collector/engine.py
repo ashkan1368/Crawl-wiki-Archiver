@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Callable
+from typing import Any, Callable
 
 from ..database.repository import ArchiveRepository, utc_now_iso
 from .discovery import extract_discovered_links, extract_sitemap_urls, parse_robots_txt
@@ -20,6 +20,7 @@ from .extractor import (
     extract_publication_catalogue_from_html,
 )
 from .safety import is_permitted_research_url
+from .wikiran_live import parse_search_cards_from_html, upsert_wikiran_documents_batch
 
 
 class PoliteHttpFetcher:
@@ -145,7 +146,7 @@ class CollectionEngine:
             return True
         try:
             row = self.repo.conn.execute(
-                "SELECT setting_value FROM app_settings WHERE setting_key = 'stop_crawl_requested';"
+                "SELECT value FROM application_settings WHERE key = 'stop_crawl_requested';"
             ).fetchone()
             if row and str(row[0]).lower() == "true":
                 self._stop_requested = True
@@ -153,6 +154,491 @@ class CollectionEngine:
         except Exception:
             pass
         return False
+
+    def _ensure_frontier_table(self) -> None:
+        self.repo.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_frontier (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL UNIQUE,
+                url_type TEXT NOT NULL DEFAULT 'ARTICLE',
+                source_hub TEXT NOT NULL DEFAULT '',
+                depth INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                discovered_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_frontier_status ON crawl_frontier(status);
+            """
+        )
+
+    def _get_existing_archived_urls(self) -> set[str]:
+        return {
+            str(r[0]).rstrip("/")
+            for r in self.repo.conn.execute(
+                "SELECT source_url FROM articles UNION SELECT source_url FROM publications;"
+            ).fetchall()
+        }
+
+    def _classify_url_type(self, url: str) -> str:
+        if "/document/articles/" in url:
+            return "ARTICLE"
+        if "/document/files/" in url:
+            return "FILE_DOC"
+        if "/document/emails/" in url:
+            return "EMAIL_DOC"
+        if "/document/csv/" in url:
+            return "CSV_DOC"
+        if "/leak/" in url:
+            return "PUBLICATION"
+        return "OTHER"
+
+    def _enqueue_frontier_urls(
+        self,
+        urls: list[str],
+        *,
+        source_hub: str,
+        depth: int,
+        existing_archived: set[str],
+    ) -> int:
+        """Insert newly discovered URLs into crawl_frontier. Returns count of NEW pending URLs added."""
+        self._ensure_frontier_table()
+        now = utc_now_iso()
+        added_new = 0
+        for raw_url in urls:
+            clean = raw_url.rstrip("/")
+            if not clean:
+                continue
+            status = "CRAWLED" if clean in existing_archived else "PENDING"
+            url_type = self._classify_url_type(clean)
+            cur = self.repo.conn.execute(
+                """
+                INSERT OR IGNORE INTO crawl_frontier (
+                    url, url_type, source_hub, depth, status, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (clean, url_type, source_hub, depth, status, now),
+            )
+            if cur.rowcount and status == "PENDING":
+                added_new += 1
+        return added_new
+
+    def _get_pagination_cursors(self) -> dict[str, int]:
+        raw = self.repo.get_settings().get("spider_pagination_cursors", "{}")
+        try:
+            parsed = json.loads(raw)
+            return {str(k): int(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_pagination_cursors(self, cursors: dict[str, int]) -> None:
+        self.repo.set_setting("spider_pagination_cursors", json.dumps(cursors, ensure_ascii=False))
+
+    def get_frontier_stats(self) -> dict[str, int]:
+        """Return live counts of discovered frontier URLs by status."""
+        self._ensure_frontier_table()
+        rows = self.repo.conn.execute(
+            "SELECT status, COUNT(*) FROM crawl_frontier GROUP BY status;"
+        ).fetchall()
+        counts = {str(r[0]): int(r[1]) for r in rows}
+        return {
+            "pending": counts.get("PENDING", 0),
+            "crawled": counts.get("CRAWLED", 0),
+            "failed": counts.get("FAILED", 0),
+            "blocked": counts.get("BLOCKED", 0),
+            "total": sum(counts.values()),
+        }
+
+    def run_discovery(self, max_pages_per_hub: int = 8) -> dict[str, Any]:
+        """
+        MODE 1 — DISCOVERY:
+        Deeply scans sitemaps, article feeds, document feeds, /leaks, /archives,
+        and advances pagination cursors across every leak collection (/leak/<slug>?page=K)
+        to discover brand-new unseen URLs and enqueue them in crawl_frontier.
+        Never re-crawls already-archived items.
+        """
+        self._ensure_frontier_table()
+        self._stop_requested = False
+        self.repo.set_setting("stop_crawl_requested", "false")
+
+        settings = self.repo.get_settings()
+        base_url = settings.get("source_base_url", "https://wikiran.org").rstrip("/")
+        strict_exclusion = settings.get("strict_sensitive_exclusion", "false").lower() == "true"
+        allow_all_paths = not strict_exclusion
+
+        now = utc_now_iso()
+        job_uuid = str(uuid.uuid4())
+        cur = self.repo.conn.execute(
+            """
+            INSERT INTO collection_jobs (
+                job_uuid, job_type, status, started_at, checkpoint_data
+            ) VALUES (?, 'DISCOVERY_SCAN', 'RUNNING', ?, '{}');
+            """,
+            (job_uuid, now),
+        )
+        job_id = int(cur.lastrowid)
+        self.repo.conn.commit()
+
+        existing_archived = self._get_existing_archived_urls()
+        cursors = self._get_pagination_cursors()
+        total_new_queued = 0
+        pages_scanned = 0
+        discovered_leaks: list[str] = []
+
+        def _log_hub(url: str, status_code: int, new_count: int) -> None:
+            self.repo.conn.execute(
+                """
+                INSERT INTO collection_history (
+                    job_id, target_url, record_type, http_status, action_taken, timestamp, message
+                ) VALUES (?, ?, 'DISCOVERY_PAGE', ?, ?, ?, ?);
+                """,
+                (
+                    job_id,
+                    url,
+                    status_code,
+                    "INSERTED" if new_count > 0 else "UNCHANGED",
+                    utc_now_iso(),
+                    f"Discovered {new_count} brand-new unseen path(s)",
+                ),
+            )
+            self.repo.conn.execute(
+                """
+                UPDATE collection_jobs
+                SET processed_count = ?, total_discovered = ?, new_records_count = ?
+                WHERE id = ?;
+                """,
+                (pages_scanned, total_new_queued, total_new_queued, job_id),
+            )
+            self.repo.conn.commit()
+
+        try:
+            # 1. Verify robots.txt
+            if settings.get("respect_robots_txt", "true").lower() == "true":
+                st_r, robots_body = self.fetch_fn(f"{base_url}/robots.txt")
+                permitted, _ = parse_robots_txt(robots_body)
+                if not permitted:
+                    self._finalize_job(job_id, "SUSPENDED", "Suspended per robots.txt rules")
+                    return {**self.get_job_summary(job_id), "frontier": self.get_frontier_stats()}
+
+            # 2. Scan /sitemap.xml
+            if not self._is_stop_signaled():
+                try:
+                    st_sm, sm_xml = self.fetch_fn(f"{base_url}/sitemap.xml")
+                    sm_urls = extract_sitemap_urls(sm_xml, base_url)
+                    candidate_sm = [
+                        u for u in sm_urls
+                        if any(p in u for p in ("/document/articles/", "/leak/", "/document/files/", "/document/emails/", "/document/csv/"))
+                    ]
+                    added = self._enqueue_frontier_urls(
+                        candidate_sm, source_hub="sitemap.xml", depth=0, existing_archived=existing_archived
+                    )
+                    total_new_queued += added
+                    pages_scanned += 1
+                    _log_hub(f"{base_url}/sitemap.xml", st_sm, added)
+                except Exception:
+                    pass
+
+            # 3. Walk ALL pages of /search?tabType=articles&page=1..N (resuming from cursor if already walked)
+            art_start = max(1, cursors.get("articles_page", 1))
+            art_max_page = art_start + max_pages_per_hub
+            p = art_start
+            while p <= art_max_page and not self._is_stop_signaled():
+                url = f"{base_url}/search?tabType=articles&page={p}"
+                try:
+                    st, html = self.fetch_fn(url)
+                    disc = extract_discovered_links(html, base_url, allow_all_paths=allow_all_paths)
+                    urls_here = disc.article_urls + disc.catalogue_urls + disc.document_urls
+                    added = self._enqueue_frontier_urls(
+                        urls_here, source_hub=url, depth=1, existing_archived=existing_archived
+                    )
+                    total_new_queued += added
+                    pages_scanned += 1
+                    _log_hub(url, st, added)
+                    if disc.pagination_pages_found:
+                        real_last = max(disc.pagination_pages_found)
+                        art_max_page = min(real_last, art_start + max(max_pages_per_hub, 20))
+                    if not urls_here or p >= art_max_page:
+                        cursors["articles_page"] = 1  # wrap back to 1 once full article pagination reached
+                        break
+                    cursors["articles_page"] = p + 1
+                    p += 1
+                except Exception:
+                    break
+
+            # 4. Walk /search?tabType=documents&page=K..K+N (advancing forward into deeper document pages!)
+            doc_start = max(1, cursors.get("documents_page", 1))
+            for p in range(doc_start, doc_start + max_pages_per_hub):
+                if self._is_stop_signaled():
+                    break
+                url = f"{base_url}/search?tabType=documents&page={p}"
+                try:
+                    st, html = self.fetch_fn(url)
+                    parsed_cards = parse_search_cards_from_html(html, base_url=base_url)
+                    if parsed_cards:
+                        upsert_wikiran_documents_batch(self.repo.conn, parsed_cards)
+                    disc = extract_discovered_links(html, base_url, allow_all_paths=allow_all_paths)
+                    urls_here = disc.article_urls + disc.catalogue_urls + disc.document_urls
+                    added = self._enqueue_frontier_urls(
+                        urls_here, source_hub=url, depth=1, existing_archived=existing_archived
+                    )
+                    total_new_queued += added
+                    pages_scanned += 1
+                    _log_hub(url, st, added)
+                    if not urls_here:
+                        break
+                    cursors["documents_page"] = p + 1
+                except Exception:
+                    break
+
+            # 5. Crawl /leaks and /archives to discover every leak collection slug
+            for hub_url in (f"{base_url}/leaks", f"{base_url}/archives"):
+                if self._is_stop_signaled():
+                    break
+                try:
+                    st, html = self.fetch_fn(hub_url)
+                    cards = extract_catalogue_cards_from_leaks_index(html, base_url)
+                    card_urls = [c.source_url for c in cards]
+                    disc = extract_discovered_links(html, base_url, allow_all_paths=allow_all_paths)
+                    for lu in card_urls + disc.catalogue_urls:
+                        clean_lu = lu.split("?")[0].rstrip("/")
+                        if "/leak/" in clean_lu and clean_lu not in discovered_leaks:
+                            discovered_leaks.append(clean_lu)
+                    urls_here = card_urls + disc.article_urls + disc.catalogue_urls + disc.document_urls
+                    added = self._enqueue_frontier_urls(
+                        urls_here, source_hub=hub_url, depth=1, existing_archived=existing_archived
+                    )
+                    total_new_queued += added
+                    pages_scanned += 1
+                    _log_hub(hub_url, st, added)
+                except Exception:
+                    pass
+
+            # 6. Deep-walk paginated /leak/<slug>?page=K across ALL leaks (advancing each leak's cursor!)
+            # Prioritize leaks with lowest cursor so every leak gets explored evenly & deeply
+            discovered_leaks.sort(key=lambda lu: cursors.get(f"leak:{lu}", 1))
+            leaks_to_probe = discovered_leaks[:12]
+            for leak_base in leaks_to_probe:
+                if self._is_stop_signaled():
+                    break
+                start_p = max(1, cursors.get(f"leak:{leak_base}", 1))
+                pages_for_this_leak = 3
+                leak_slug = leak_base.rstrip("/").split("/")[-1]
+                for lp in range(start_p, start_p + pages_for_this_leak):
+                    if self._is_stop_signaled():
+                        break
+                    page_url = f"{base_url}/search?tabType=documents&leaksSources%5B0%5D={leak_slug}&page={lp}"
+                    try:
+                        st, html = self.fetch_fn(page_url)
+                        parsed_cards = parse_search_cards_from_html(html, base_url=base_url)
+                        if parsed_cards:
+                            upsert_wikiran_documents_batch(self.repo.conn, parsed_cards)
+                        disc = extract_discovered_links(html, base_url, allow_all_paths=allow_all_paths)
+                        urls_here = disc.article_urls + disc.document_urls + disc.catalogue_urls
+                        added = self._enqueue_frontier_urls(
+                            urls_here, source_hub=page_url, depth=2, existing_archived=existing_archived
+                        )
+                        total_new_queued += added
+                        pages_scanned += 1
+                        _log_hub(page_url, st, added)
+                        if not urls_here:
+                            # Reached the real end of this leak's pages
+                            cursors[f"leak:{leak_base}"] = 999999
+                            break
+                        cursors[f"leak:{leak_base}"] = lp + 1
+                    except Exception:
+                        break
+
+            self._save_pagination_cursors(cursors)
+
+            if self._is_stop_signaled():
+                self._finalize_job(
+                    job_id,
+                    "INTERRUPTED",
+                    f"Discovery stopped by user after scanning {pages_scanned} hubs ({total_new_queued} new paths queued).",
+                )
+            else:
+                self._finalize_job(job_id, "COMPLETED", None)
+        except PermissionError as perm_err:
+            self._save_pagination_cursors(cursors)
+            self._finalize_job(job_id, "SUSPENDED", str(perm_err))
+        except Exception as exc:
+            self._save_pagination_cursors(cursors)
+            self._finalize_job(job_id, "FAILED", f"Discovery scan failed: {exc}")
+
+        return {
+            **self.get_job_summary(job_id),
+            "new_paths_discovered": total_new_queued,
+            "pages_scanned": pages_scanned,
+            "frontier": self.get_frontier_stats(),
+        }
+
+    def run_deep_spider(self, max_items: int = 80) -> dict[str, Any]:
+        """
+        MODE 2 — DEEP SPIDER CRAWL:
+        Drains ONLY brand-new unseen PENDING URLs from `crawl_frontier` (never repeating already-archived URLs),
+        auto-expands deeper frontier pages if the queue is empty, and recursively follows every newly discovered
+        child link inside each fetched page until `max_items` (or unlimited if <=0) or Stop is clicked.
+        """
+        self._ensure_frontier_table()
+        self._stop_requested = False
+        self.repo.set_setting("stop_crawl_requested", "false")
+
+        # Sync frontier with any URLs already archived so we NEVER re-crawl them in deep spider mode
+        existing_archived = self._get_existing_archived_urls()
+        pending_rows = self.repo.conn.execute(
+            """
+            SELECT url FROM crawl_frontier
+            WHERE status = 'PENDING'
+            ORDER BY depth ASC, id ASC;
+            """
+        ).fetchall()
+        pending_urls = [str(r[0]) for r in pending_rows if str(r[0]).rstrip("/") not in existing_archived]
+
+        # If frontier has no pending unseen URLs yet, automatically advance deep discovery cursors first!
+        if not pending_urls:
+            disc_res = self.run_discovery(max_pages_per_hub=6)
+            if self._is_stop_signaled():
+                return disc_res
+            pending_rows = self.repo.conn.execute(
+                """
+                SELECT url FROM crawl_frontier
+                WHERE status = 'PENDING'
+                ORDER BY depth ASC, id ASC;
+                """
+            ).fetchall()
+            pending_urls = [str(r[0]) for r in pending_rows if str(r[0]).rstrip("/") not in existing_archived]
+
+        now = utc_now_iso()
+        job_uuid = str(uuid.uuid4())
+        effective_limit = 5000 if max_items <= 0 else max(1, int(max_items))
+        batch_urls = pending_urls[:effective_limit]
+
+        cur = self.repo.conn.execute(
+            """
+            INSERT INTO collection_jobs (
+                job_uuid, job_type, status, started_at, total_discovered, checkpoint_data
+            ) VALUES (?, 'DEEP_SPIDER', 'RUNNING', ?, ?, ?);
+            """,
+            (
+                job_uuid,
+                now,
+                len(batch_urls),
+                json.dumps({"pending_urls": batch_urls, "completed_urls": []}),
+            ),
+        )
+        job_id = int(cur.lastrowid)
+        self.repo.conn.commit()
+
+        if not batch_urls:
+            self._finalize_job(
+                job_id,
+                "COMPLETED",
+                "All currently discovered paths are already archived. Run Discovery to probe deeper pages.",
+            )
+            return {**self.get_job_summary(job_id), "frontier": self.get_frontier_stats()}
+
+        summary = self._process_queue(
+            job_id=job_id,
+            pending_urls=batch_urls,
+            completed_urls=[],
+            simulate_interrupt_after=None,
+            deep_spider=True,
+            max_total_items=effective_limit,
+            update_frontier=True,
+        )
+        return {**summary, "frontier": self.get_frontier_stats()}
+
+    def run_update_check(self, max_recheck: int = 25) -> dict[str, Any]:
+        """
+        MODE 3 — CHECK UPDATES:
+        Specifically checks:
+        1) Top index pages (/search?tabType=articles&page=1 and /leaks) for newly published items.
+        2) The oldest already-downloaded articles & publications (ordered by last_verified_at ASC)
+           to detect content updates via SHA-256 content_hash comparison without re-crawling deep history.
+        """
+        self._ensure_frontier_table()
+        self._stop_requested = False
+        self.repo.set_setting("stop_crawl_requested", "false")
+
+        settings = self.repo.get_settings()
+        base_url = settings.get("source_base_url", "https://wikiran.org").rstrip("/")
+        strict_exclusion = settings.get("strict_sensitive_exclusion", "false").lower() == "true"
+        allow_all_paths = not strict_exclusion
+
+        now = utc_now_iso()
+        job_uuid = str(uuid.uuid4())
+        cur = self.repo.conn.execute(
+            """
+            INSERT INTO collection_jobs (
+                job_uuid, job_type, status, started_at, checkpoint_data
+            ) VALUES (?, 'UPDATE_CHECK', 'RUNNING', ?, '{}');
+            """,
+            (job_uuid, now),
+        )
+        job_id = int(cur.lastrowid)
+        self.repo.conn.commit()
+
+        existing_archived = self._get_existing_archived_urls()
+        urls_to_check: list[str] = []
+
+        try:
+            # 1. Check front pages for brand-new recent articles/leaks
+            for fresh_hub in (f"{base_url}/search?tabType=articles&page=1", f"{base_url}/leaks"):
+                if self._is_stop_signaled():
+                    break
+                try:
+                    _, html = self.fetch_fn(fresh_hub)
+                    disc = extract_discovered_links(html, base_url, allow_all_paths=allow_all_paths)
+                    for u in disc.article_urls + disc.catalogue_urls:
+                        if u.rstrip("/") not in existing_archived and u not in urls_to_check:
+                            urls_to_check.append(u)
+                except Exception:
+                    pass
+
+            # 2. Add oldest already-downloaded articles & publications to verify if updated on source
+            remaining_slots = max(5, max_recheck - len(urls_to_check))
+            old_rows = self.repo.conn.execute(
+                """
+                SELECT source_url, last_verified_at FROM (
+                    SELECT source_url, last_verified_at FROM articles
+                    UNION ALL
+                    SELECT source_url, last_verified_at FROM publications
+                )
+                WHERE source_url LIKE 'https://wikiran.org/%'
+                ORDER BY last_verified_at ASC
+                LIMIT ?;
+                """,
+                (remaining_slots,),
+            ).fetchall()
+            for r in old_rows:
+                u = str(r[0])
+                if u not in urls_to_check:
+                    urls_to_check.append(u)
+        except Exception as exc:
+            self._finalize_job(job_id, "FAILED", f"Update check setup failed: {exc}")
+            return {**self.get_job_summary(job_id), "frontier": self.get_frontier_stats()}
+
+        self.repo.conn.execute(
+            "UPDATE collection_jobs SET total_discovered = ?, checkpoint_data = ? WHERE id = ?;",
+            (
+                len(urls_to_check),
+                json.dumps({"pending_urls": urls_to_check, "completed_urls": []}),
+                job_id,
+            ),
+        )
+        self.repo.conn.commit()
+
+        summary = self._process_queue(
+            job_id=job_id,
+            pending_urls=urls_to_check,
+            completed_urls=[],
+            simulate_interrupt_after=None,
+            deep_spider=False,
+            max_total_items=len(urls_to_check),
+            update_frontier=True,
+        )
+        return {**summary, "frontier": self.get_frontier_stats()}
 
     def create_interrupted_checkpoint_job(
         self,
@@ -465,6 +951,7 @@ class CollectionEngine:
         simulate_interrupt_after: int | None,
         deep_spider: bool = False,
         max_total_items: int = 50,
+        update_frontier: bool = False,
     ) -> dict[str, int | str]:
         cat_map = {c["slug"]: int(c["id"]) for c in self.repo.list_categories()}
         step_count = 0
@@ -531,15 +1018,23 @@ class CollectionEngine:
                 http_status, html_body = self.fetch_fn(target_url)
 
                 # Recursive Spider Expansion: extract any newly discovered article/leak/document links inside this page
-                if deep_spider and (len(done) + len(remaining)) < max_total_items:
+                if deep_spider:
                     inner_disc = extract_discovered_links(
                         html_body, base_url, allow_all_paths=allow_all_paths
                     )
-                    for child_url in (
+                    discovered_children = (
                         inner_disc.article_urls
                         + inner_disc.catalogue_urls
                         + inner_disc.document_urls
-                    ):
+                    )
+                    if update_frontier and discovered_children:
+                        self._enqueue_frontier_urls(
+                            discovered_children,
+                            source_hub=target_url,
+                            depth=3,
+                            existing_archived=existing_in_db,
+                        )
+                    for child_url in discovered_children:
                         norm_child = child_url.rstrip("/")
                         if (
                             norm_child not in seen_in_queue
@@ -557,6 +1052,7 @@ class CollectionEngine:
                     "/document/articles/" in target_url
                     or "/document/emails/" in target_url
                     or "/document/files/" in target_url
+                    or "/document/csv/" in target_url
                 ):
                     extracted = extract_article_from_html(
                         html_body,
@@ -649,12 +1145,37 @@ class CollectionEngine:
                         f"Processed {rec_type.lower()} ({action})",
                     ),
                 )
+                if update_frontier:
+                    self.repo.conn.execute(
+                        """
+                        INSERT INTO crawl_frontier (url, url_type, source_hub, depth, status, discovered_at, last_checked_at)
+                        VALUES (?, ?, ?, 0, 'CRAWLED', ?, ?)
+                        ON CONFLICT(url) DO UPDATE SET status = 'CRAWLED', last_checked_at = excluded.last_checked_at, error_message = NULL;
+                        """,
+                        (
+                            target_url.rstrip("/"),
+                            self._classify_url_type(target_url),
+                            "crawled",
+                            utc_now_iso(),
+                            utc_now_iso(),
+                        ),
+                    )
+                existing_in_db.add(target_url.rstrip("/"))
                 self.repo.conn.commit()
             except PermissionError as perm_err:
                 self._finalize_job(job_id, "SUSPENDED", str(perm_err))
                 return self.get_job_summary(job_id)
             except Exception as exc:
                 remaining.pop(0)
+                if update_frontier:
+                    self.repo.conn.execute(
+                        """
+                        UPDATE crawl_frontier
+                        SET status = 'FAILED', last_checked_at = ?, error_message = ?
+                        WHERE url = ?;
+                        """,
+                        (utc_now_iso(), str(exc)[:300], target_url.rstrip("/")),
+                    )
                 checkpoint = {"pending_urls": remaining, "completed_urls": done}
                 self.repo.conn.execute(
                     """

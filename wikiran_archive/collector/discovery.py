@@ -71,9 +71,9 @@ def extract_discovered_links(
         return result
 
     raw_hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_content)
-    # Scan embedded JSON / Next.js __NEXT_DATA__ state for all article, email, file, leak, and archive paths
+    # Scan embedded JSON / Next.js __NEXT_DATA__ state for all article, email, file, csv, leak, and archive paths
     embedded_paths = re.findall(
-        r'/(?:document/(?:articles|emails|files)/[a-zA-Z0-9_-]+|leak/[a-zA-Z0-9_-]+|archives(?:/[a-zA-Z0-9_-]+)?)',
+        r'/(?:document/(?:articles|emails|files|csv)/[a-zA-Z0-9_-]+|leak/[a-zA-Z0-9_-]+|archives(?:/[a-zA-Z0-9_-]+)?)',
         html_content,
     )
     # Also scan full https://wikiran.org/... URLs inside scripts or JSON
@@ -101,7 +101,7 @@ def extract_discovered_links(
         full_url = normalize_url(href, base_url)
         permitted, _reason = is_permitted_research_url(full_url, allow_all_paths=allow_all_paths)
         if not permitted:
-            if "/document/emails/" in full_url or "/document/files/" in full_url:
+            if "/document/emails/" in full_url or "/document/files/" in full_url or "/document/csv/" in full_url:
                 if full_url not in seen_blocked:
                     seen_blocked.add(full_url)
                     result.blocked_sensitive_urls.append(full_url)
@@ -115,13 +115,17 @@ def extract_discovered_links(
             if full_url not in seen_catalogues:
                 seen_catalogues.add(full_url)
                 result.catalogue_urls.append(full_url)
-        elif allow_all_paths and ("/document/emails/" in full_url or "/document/files/" in full_url):
+        elif allow_all_paths and (
+            "/document/emails/" in full_url
+            or "/document/files/" in full_url
+            or "/document/csv/" in full_url
+        ):
             if full_url not in seen_documents:
                 seen_documents.add(full_url)
                 result.document_urls.append(full_url)
         elif any(
             hub in full_url
-            for hub in ("/leaks", "/archives", "/search?tabType=")
+            for hub in ("/leaks", "/archives", "/search?tabType=", "/leak/")
         ):
             if full_url not in seen_seeds:
                 seen_seeds.add(full_url)
@@ -134,10 +138,10 @@ def extract_discovered_links(
     # Detect MUI pagination buttons and total page indicators in HTML / Next.js state
     for p_num in re.findall(r'MuiPaginationItem-page[^>]*>(\d+)<', html_content):
         pages.add(int(p_num))
-    for p_num in re.findall(r'"totalPages"\s*:\s*(\d+)', html_content):
-        total_p = min(50, int(p_num))
-        for i in range(1, total_p + 1):
-            pages.add(i)
+    for p_num in re.findall(r'"(?:totalPages|pageCount|numPages)"\s*:\s*(\d+)', html_content):
+        val = int(p_num)
+        if val > 0:
+            pages.add(val)
 
     result.pagination_pages_found = sorted(pages)
     return result
