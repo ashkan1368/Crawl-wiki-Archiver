@@ -23,14 +23,82 @@ class SearchFilters:
     organization_name: str | None = None
     source_type: str | None = None  # 'ARTICLE', 'PUBLICATION', 'CSV_ROW', 'FILE_INVENTORY', 'ENTITY', or None for all
     extraction_status: str | None = None
+    exact_match: bool = False
 
 
-def _build_safe_fts_query(raw_query: str) -> str:
-    """Sanitize user input into a safe FTS5 prefix/token query."""
+def parse_exact_query(raw_query: str, exact_flag: bool = False) -> tuple[str, bool]:
+    """
+    Detect explicit exact-phrase mode either from the UI toggle (`exact_flag=True`)
+    or when the user wraps their query in double quotes (e.g. `"Bank Sepah"`).
+    Returns `(cleaned_query, effective_exact_mode)`.
+    """
+    q = (raw_query or "").strip()
+    if len(q) >= 2 and q[0] == '"' and q[-1] == '"':
+        inner = q[1:-1].strip()
+        if inner:
+            return inner, True
+    return q, bool(exact_flag)
+
+
+def _build_safe_fts_query(raw_query: str, *, exact_match: bool = False) -> str:
+    """
+    Sanitize user input into a safe FTS5 query.
+    - When `exact_match=False`: prefix-wildcard AND query (`"tok1"* AND "tok2"*`).
+    - When `exact_match=True`: exact FTS5 phrase query (`"tok1 tok2"`) with NO `*` prefix wildcard.
+    """
     tokens = re.findall(r"[\w\u0600-\u06FF]+", raw_query, flags=re.UNICODE)
     if not tokens:
         return ""
+    if exact_match:
+        phrase = " ".join(tokens)
+        return f'"{phrase}"'
     return " AND ".join(f'"{t}"*' for t in tokens)
+
+
+def matches_exact_word_or_phrase(record: dict[str, Any], raw_query: str) -> bool:
+    """
+    Strict whole-word / exact-phrase verifier (Unicode-aware, supports English & Persian).
+    Ensures e.g. `"Sepah"` matches `"Bank Sepah"` and NEVER matches `"Sepahan"`,
+    and `"Bank Sepah"` matches the consecutive phrase `"Bank Sepah"` only.
+    """
+    clean_q, _ = parse_exact_query(raw_query, exact_flag=True)
+    if not clean_q:
+        return True
+
+    # Normalize internal whitespace in query so multi-word phrases match across single/multi spaces or newlines
+    parts = [re.escape(p) for p in re.split(r"\s+", clean_q) if p]
+    if not parts:
+        return True
+    phrase_pattern = r"\s+".join(parts)
+
+    # Apply word boundaries on ends that start/end with a word character (\w covers Latin, digits, Arabic/Persian letters)
+    prefix_boundary = r"(?<!\w)" if re.match(r"^\w", clean_q, flags=re.UNICODE) else ""
+    suffix_boundary = r"(?!\w)" if re.search(r"\w$", clean_q, flags=re.UNICODE) else ""
+    regex = re.compile(
+        f"{prefix_boundary}{phrase_pattern}{suffix_boundary}",
+        flags=re.IGNORECASE | re.UNICODE,
+    )
+
+    haystack_fields = (
+        record.get("title"),
+        record.get("native_title"),
+        record.get("short_description"),
+        record.get("editorial_content"),
+        record.get("organizations"),
+        record.get("tags"),
+        record.get("source_name"),
+        record.get("ofac_programs"),
+        record.get("ofac_aliases"),
+        record.get("ofac_addresses"),
+        record.get("ofac_countries"),
+        record.get("os_datasets"),
+        record.get("os_identifiers"),
+        record.get("source_url"),
+    )
+    for field_val in haystack_fields:
+        if field_val and regex.search(str(field_val)):
+            return True
+    return False
 
 
 UNIFIED_FTS5_JOIN_SQL = """
@@ -480,10 +548,12 @@ class ArchiveSearchEngine:
     def search(self, filters: SearchFilters) -> list[dict[str, Any]]:
         """
         Execute a single unified SQLite FTS5 query joining `fts_archive` across all tables:
-        `articles`, `publications`, `csv_row_content`, `file_metadata`, and `organizations`.
+        `articles`, `publications`, `csv_row_content`, `file_metadata`, `organizations`,
+        `ofac_entities`, `opensanctions_entities`, and `wikiran_documents`.
         """
         self._ensure_views_and_fts_synced()
-        fts_query = _build_safe_fts_query(filters.query)
+        clean_query, effective_exact = parse_exact_query(filters.query, filters.exact_match)
+        fts_query = _build_safe_fts_query(clean_query, exact_match=effective_exact)
         has_fts = 1 if fts_query else 0
 
         norm_source_type = filters.source_type
@@ -511,36 +581,37 @@ class ArchiveSearchEngine:
         rows = self.conn.execute(sql_query, params).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
-            results.append(
-                {
-                    "record_type": row["record_type"],
-                    "id": int(row["id"]),
-                    "title": row["title"],
-                    "native_title": row["native_title"] or "",
-                    "short_description": row["short_description"] or "",
-                    "editorial_content": row["editorial_content"] or "",
-                    "publication_date": row["publication_date"] or "",
-                    "category_en": row["category_en"],
-                    "category_fa": row["category_fa"],
-                    "organizations": row["organizations"] or "",
-                    "tags": row["tags"] or "",
-                    "source_name": row["source_name"],
-                    "source_url": row["source_url"] or "",
-                    "extraction_status": row["extraction_status"],
-                    "retrieved_at": row["retrieved_at"] or "",
-                    "record_version": int(row["record_version"] or 1),
-                    "ofac_ent_num": int(row["ofac_ent_num"]) if row["ofac_ent_num"] is not None else None,
-                    "ofac_list_source": row["ofac_list_source"] or "",
-                    "ofac_sdn_type": row["ofac_sdn_type"] or "",
-                    "ofac_programs": row["ofac_programs"] or "",
-                    "ofac_aliases": row["ofac_aliases"] or "",
-                    "ofac_addresses": row["ofac_addresses"] or "",
-                    "ofac_countries": row["ofac_countries"] or "",
-                    "os_id": row["os_id"] or "",
-                    "os_schema": row["os_schema"] or "",
-                    "os_datasets": row["os_datasets"] or "",
-                    "os_identifiers": row["os_identifiers"] or "",
-                    "wikiran_doc_type": row["wikiran_doc_type"] or "",
-                }
-            )
+            item = {
+                "record_type": row["record_type"],
+                "id": int(row["id"]),
+                "title": row["title"],
+                "native_title": row["native_title"] or "",
+                "short_description": row["short_description"] or "",
+                "editorial_content": row["editorial_content"] or "",
+                "publication_date": row["publication_date"] or "",
+                "category_en": row["category_en"],
+                "category_fa": row["category_fa"],
+                "organizations": row["organizations"] or "",
+                "tags": row["tags"] or "",
+                "source_name": row["source_name"],
+                "source_url": row["source_url"] or "",
+                "extraction_status": row["extraction_status"],
+                "retrieved_at": row["retrieved_at"] or "",
+                "record_version": int(row["record_version"] or 1),
+                "ofac_ent_num": int(row["ofac_ent_num"]) if row["ofac_ent_num"] is not None else None,
+                "ofac_list_source": row["ofac_list_source"] or "",
+                "ofac_sdn_type": row["ofac_sdn_type"] or "",
+                "ofac_programs": row["ofac_programs"] or "",
+                "ofac_aliases": row["ofac_aliases"] or "",
+                "ofac_addresses": row["ofac_addresses"] or "",
+                "ofac_countries": row["ofac_countries"] or "",
+                "os_id": row["os_id"] or "",
+                "os_schema": row["os_schema"] or "",
+                "os_datasets": row["os_datasets"] or "",
+                "os_identifiers": row["os_identifiers"] or "",
+                "wikiran_doc_type": row["wikiran_doc_type"] or "",
+            }
+            if effective_exact and clean_query and not matches_exact_word_or_phrase(item, clean_query):
+                continue
+            results.append(item)
         return results

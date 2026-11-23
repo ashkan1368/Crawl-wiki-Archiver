@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from .collector.engine import CollectionEngine
 from .collector.ofac_sync import get_ofac_summary, sync_ofac_lists
 from .collector.opensanctions_sync import get_opensanctions_summary, sync_opensanctions_dataset
 from .collector.reconnaissance import generate_reconnaissance_markdown, run_reconnaissance
+from .collector.sanctions_live import search_ofac_live, search_opensanctions_live
 from .collector.scheduler import ScheduledCollectionRunner
 from .collector.wikiran_live import (
     download_targeted_leaks,
@@ -28,6 +30,7 @@ from .collector.wikiran_live import (
     get_wikiran_documents_summary,
     search_wikiran_live,
     sync_wikiran_structured_archives,
+    upsert_wikiran_documents_batch,
 )
 from .config.settings import AppPaths, resolve_app_paths
 from .database.connection import get_connection, verify_database_integrity
@@ -37,12 +40,13 @@ from .database.seed import seed_verified_public_archive
 from .export.csv_converter import CsvSpreadsheetWorkbench
 from .export.exporters import ArchiveExporter
 from .logging_utils.logger import friendly_clerk_message, read_diagnostic_logs, setup_logger
+from .packaging.windows_bundle import get_app_build_info
 from .search.batch_screener import (
     generate_watchlist_template_csv,
     generate_watchlist_template_xlsx,
     run_batch_watchlist_screening,
 )
-from .search.fts_search import ArchiveSearchEngine, SearchFilters
+from .search.fts_search import ArchiveSearchEngine, SearchFilters, parse_exact_query
 from .ui.main_window import DesktopController, launch_pyside6_gui
 
 
@@ -231,8 +235,10 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
         if action == "overview":
             ok, msg = verify_database_integrity(paths.db_path)
             backup_mgr = BackupManager(paths.db_path, paths.backups_dir)
+            project_root = Path(__file__).resolve().parent.parent
             return {
                 "ok": True,
+                "app_build": get_app_build_info(project_root),
                 "stats": repo.get_dashboard_stats(),
                 "trends": repo.get_collection_trends(),
                 "schedule": asdict(scheduler.get_schedule_config(repo)),
@@ -314,72 +320,228 @@ def handle_api_command(action: str, payload_json: str = "{}", custom_dir: str | 
         if action == "search":
             raw_query = str(payload.get("query", "") or "").strip()
             req_source_type = payload.get("source_type") or None
-            include_live = bool(payload.get("include_live_wikiran", True))
+            exact_flag = bool(payload.get("exact_match", False))
+            clean_query, effective_exact = parse_exact_query(raw_query, exact_flag)
+
+            include_live_wikiran = bool(payload.get("include_live_wikiran", True))
+            include_live_ofac = bool(payload.get("include_live_ofac", True))
+            include_live_opensanctions = bool(payload.get("include_live_opensanctions", True))
             leak_source_filter = str(payload.get("leak_source") or "").strip() or None
             live_pages = int(payload.get("live_pages", 2))
 
+            local_source_type = (
+                None
+                if req_source_type in ("WIKIRAN_LIVE", "OFAC_LIVE", "OPENSANCTIONS_LIVE")
+                else req_source_type
+            )
             filters = SearchFilters(
                 query=raw_query,
                 date_from=payload.get("date_from") or None,
                 date_to=payload.get("date_to") or None,
                 category_slug=payload.get("category_slug") or None,
                 organization_name=payload.get("organization_name") or None,
-                source_type=req_source_type,
+                source_type=local_source_type,
                 extraction_status=payload.get("extraction_status") or None,
+                exact_match=effective_exact,
             )
             engine = ArchiveSearchEngine(repo.conn)
-            local_results = engine.search(filters)
+            local_results = (
+                []
+                if req_source_type in ("WIKIRAN_LIVE", "OFAC_LIVE", "OPENSANCTIONS_LIVE")
+                else engine.search(filters)
+            )
 
-            wikiran_live_meta: dict[str, Any] | None = None
-            should_run_live = (
-                include_live
-                and bool(raw_query)
+            should_run_wikiran_live = (
+                include_live_wikiran
+                and bool(clean_query)
                 and req_source_type in (None, "", "ALL", "WIKIRAN_DOC", "WIKIRAN_LIVE")
             )
-            merged_results = list(local_results)
-            if should_run_live:
-                live_resp = search_wikiran_live(
-                    repo,
-                    raw_query,
-                    max_pages=live_pages,
-                    tab_type="all",
-                    leak_source=leak_source_filter,
-                    auto_cache=True,
-                )
-                wikiran_live_meta = {
-                    "online": live_resp.get("online", False),
-                    "total_label": live_resp.get("total_label", ""),
-                    "total_int": live_resp.get("total_int", 0),
-                    "facets": live_resp.get("facets", []),
-                    "fetched_count": live_resp.get("fetched_count", 0),
-                    "cached_new_count": live_resp.get("cached_new_count", 0),
-                    "search_url": live_resp.get("search_url", ""),
-                    "error": live_resp.get("error", ""),
+            should_run_ofac_live = (
+                include_live_ofac
+                and bool(clean_query)
+                and req_source_type in (None, "", "ALL", "OFAC_SANCTION", "OFAC_LIVE")
+            )
+            should_run_os_live = (
+                include_live_opensanctions
+                and bool(clean_query)
+                and req_source_type in (None, "", "ALL", "OPENSANCTIONS", "OPENSANCTIONS_LIVE")
+            )
+
+            wikiran_live_resp: dict[str, Any] | None = None
+            ofac_live_resp: dict[str, Any] | None = None
+            os_live_resp: dict[str, Any] | None = None
+
+            # Execute enabled live network queries in parallel so all 3 finish in ~1-2s total!
+            if should_run_wikiran_live or should_run_ofac_live or should_run_os_live:
+                wikiran_base_url = repo.get_settings().get("source_base_url", "https://wikiran.org").rstrip("/")
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    fut_w = (
+                        pool.submit(
+                            search_wikiran_live,
+                            None,
+                            raw_query,
+                            max_pages=live_pages,
+                            tab_type="all",
+                            leak_source=leak_source_filter,
+                            auto_cache=False,  # SQLite write happens safely on main thread below
+                            exact_match=effective_exact,
+                            base_url=wikiran_base_url,
+                        )
+                        if should_run_wikiran_live
+                        else None
+                    )
+                    fut_ofac = (
+                        pool.submit(
+                            search_ofac_live,
+                            raw_query,
+                            exact_match=effective_exact,
+                        )
+                        if should_run_ofac_live
+                        else None
+                    )
+                    fut_os = (
+                        pool.submit(
+                            search_opensanctions_live,
+                            raw_query,
+                            exact_match=effective_exact,
+                        )
+                        if should_run_os_live
+                        else None
+                    )
+                    if fut_w is not None:
+                        wikiran_live_resp = fut_w.result()
+                    if fut_ofac is not None:
+                        ofac_live_resp = fut_ofac.result()
+                    if fut_os is not None:
+                        os_live_resp = fut_os.result()
+
+            # Persist WikIran live cards into local SQLite safely on main thread
+            cached_new_wikiran = 0
+            if wikiran_live_resp and wikiran_live_resp.get("online") and wikiran_live_resp.get("raw_cards"):
+                try:
+                    cached_new_wikiran, _ = upsert_wikiran_documents_batch(
+                        repo.conn, wikiran_live_resp["raw_cards"]
+                    )
+                except Exception:
+                    cached_new_wikiran = 0
+
+            wikiran_live_meta: dict[str, Any] | None = None
+            ofac_live_meta: dict[str, Any] | None = None
+            opensanctions_live_meta: dict[str, Any] | None = None
+
+            local_ofac_ent_nums = {
+                int(r["ofac_ent_num"])
+                for r in local_results
+                if r.get("record_type") == "OFAC_SANCTION" and r.get("ofac_ent_num") is not None
+            }
+            local_ofac_titles = {
+                str(r.get("title") or "").strip().lower()
+                for r in local_results
+                if r.get("record_type") == "OFAC_SANCTION"
+            }
+            local_os_ids = {
+                str(r.get("os_id") or "").strip().lower()
+                for r in local_results
+                if r.get("record_type") == "OPENSANCTIONS" and r.get("os_id")
+            }
+            local_os_titles = {
+                str(r.get("title") or "").strip().lower()
+                for r in local_results
+                if r.get("record_type") == "OPENSANCTIONS"
+            }
+            existing_urls = {
+                str(r.get("source_url") or "").rstrip("/") for r in local_results
+            }
+
+            ofac_live_new: list[dict[str, Any]] = []
+            if ofac_live_resp is not None:
+                all_ofac_live = ofac_live_resp.get("results", [])
+                for item in all_ofac_live:
+                    ent_n = item.get("ofac_ent_num")
+                    t_low = str(item.get("title") or "").strip().lower()
+                    if (ent_n is not None and int(ent_n) in local_ofac_ent_nums) or t_low in local_ofac_titles:
+                        continue
+                    ofac_live_new.append(item)
+                ofac_live_meta = {
+                    "online": ofac_live_resp.get("online", False),
+                    "total_label": ofac_live_resp.get("total_label", ""),
+                    "total_int": ofac_live_resp.get("total_int", 0),
+                    "fetched_count": ofac_live_resp.get("fetched_count", 0),
+                    "new_not_in_local": len(ofac_live_new),
+                    "search_url": ofac_live_resp.get("search_url", ""),
+                    "error": ofac_live_resp.get("error", ""),
+                    "results": all_ofac_live,
                 }
-                existing_urls = {
-                    str(r.get("source_url") or "").rstrip("/") for r in merged_results
+
+            os_live_new: list[dict[str, Any]] = []
+            if os_live_resp is not None:
+                all_os_live = os_live_resp.get("results", [])
+                for item in all_os_live:
+                    oid = str(item.get("os_id") or "").strip().lower()
+                    t_low = str(item.get("title") or "").strip().lower()
+                    if (oid and oid in local_os_ids) or t_low in local_os_titles:
+                        continue
+                    os_live_new.append(item)
+                opensanctions_live_meta = {
+                    "online": os_live_resp.get("online", False),
+                    "total_label": os_live_resp.get("total_label", ""),
+                    "total_int": os_live_resp.get("total_int", 0),
+                    "fetched_count": os_live_resp.get("fetched_count", 0),
+                    "new_not_in_local": len(os_live_new),
+                    "search_url": os_live_resp.get("search_url", ""),
+                    "error": os_live_resp.get("error", ""),
+                    "results": all_os_live,
                 }
-                live_new_items = [
+
+            wikiran_live_new: list[dict[str, Any]] = []
+            if wikiran_live_resp is not None:
+                all_w_live = wikiran_live_resp.get("results", [])
+                wikiran_live_new = [
                     item
-                    for item in live_resp.get("results", [])
+                    for item in all_w_live
                     if str(item.get("source_url") or "").rstrip("/") not in existing_urls
                 ]
-                # Insert live WikIran hits right after OFAC/OpenSanctions matches so they're immediately visible!
-                sanction_items = [
-                    r for r in merged_results if r.get("record_type") in ("OFAC_SANCTION", "OPENSANCTIONS")
+                wikiran_live_meta = {
+                    "online": wikiran_live_resp.get("online", False),
+                    "total_label": wikiran_live_resp.get("total_label", ""),
+                    "total_int": wikiran_live_resp.get("total_int", 0),
+                    "facets": wikiran_live_resp.get("facets", []),
+                    "fetched_count": wikiran_live_resp.get("fetched_count", 0),
+                    "cached_new_count": cached_new_wikiran,
+                    "search_url": wikiran_live_resp.get("search_url", ""),
+                    "error": wikiran_live_resp.get("error", ""),
+                }
+
+            if req_source_type == "OFAC_LIVE":
+                merged_results = (ofac_live_resp or {}).get("results", [])
+            elif req_source_type == "OPENSANCTIONS_LIVE":
+                merged_results = (os_live_resp or {}).get("results", [])
+            elif req_source_type == "WIKIRAN_LIVE":
+                merged_results = (wikiran_live_resp or {}).get("results", [])
+            else:
+                local_ofac = [r for r in local_results if r.get("record_type") == "OFAC_SANCTION"]
+                local_os = [r for r in local_results if r.get("record_type") == "OPENSANCTIONS"]
+                other_local = [
+                    r
+                    for r in local_results
+                    if r.get("record_type") not in ("OFAC_SANCTION", "OPENSANCTIONS")
                 ]
-                other_local_items = [
-                    r for r in merged_results if r.get("record_type") not in ("OFAC_SANCTION", "OPENSANCTIONS")
-                ]
-                if req_source_type == "WIKIRAN_LIVE":
-                    merged_results = live_resp.get("results", [])
-                else:
-                    merged_results = sanction_items + live_new_items + other_local_items
+                merged_results = (
+                    ofac_live_new
+                    + local_ofac
+                    + os_live_new
+                    + local_os
+                    + wikiran_live_new
+                    + other_local
+                )
 
             return {
                 "ok": True,
+                "exact_match": effective_exact,
                 "results": merged_results,
                 "wikiran_live": wikiran_live_meta,
+                "ofac_live": ofac_live_meta,
+                "opensanctions_live": opensanctions_live_meta,
             }
 
         if action == "set_settings":

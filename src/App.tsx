@@ -206,6 +206,12 @@ interface ActiveCsvPayload {
 
 interface OverviewPayload {
   ok: boolean;
+  app_build?: {
+    version: string;
+    dist_built_at: string;
+    dist_fresh: boolean;
+    auto_rebuild_enabled: boolean;
+  };
   stats: {
     articles_count: number;
     publications_count: number;
@@ -410,9 +416,14 @@ export default function App() {
     storage_volume?: OverviewPayload['storage_volume'];
   } | null>(null);
 
-  // Quick source-scope tab inside Universal Search results (All vs OFAC vs OpenSanctions vs WikIran)
-  const [searchScopeTab, setSearchScopeTab] = useState<'ALL' | 'OFAC' | 'OPENSANCTIONS' | 'WIKIRAN'>('ALL');
+  // Quick source-scope tab inside Universal Search results (All vs OFAC vs OFAC Live vs OpenSanctions vs OpenSanctions Live vs WikIran)
+  const [searchScopeTab, setSearchScopeTab] = useState<
+    'ALL' | 'OFAC' | 'OFAC_LIVE' | 'OPENSANCTIONS' | 'OPENSANCTIONS_LIVE' | 'WIKIRAN'
+  >('ALL');
+  const [exactMatch, setExactMatch] = useState<boolean>(false);
   const [includeLiveWikIran, setIncludeLiveWikIran] = useState<boolean>(true);
+  const [includeLiveOfac, setIncludeLiveOfac] = useState<boolean>(true);
+  const [includeLiveOpenSanctions, setIncludeLiveOpenSanctions] = useState<boolean>(true);
   const [activeLeakSourceFilter, setActiveLeakSourceFilter] = useState<string>('');
   const [wikiranLiveMeta, setWikiranLiveMeta] = useState<{
     online: boolean;
@@ -423,6 +434,26 @@ export default function App() {
     cached_new_count: number;
     search_url: string;
     error?: string;
+  } | null>(null);
+  const [ofacLiveMeta, setOfacLiveMeta] = useState<{
+    online: boolean;
+    total_label: string;
+    total_int: number;
+    fetched_count: number;
+    new_not_in_local: number;
+    search_url: string;
+    error?: string;
+    results?: Array<Record<string, unknown>>;
+  } | null>(null);
+  const [osLiveMeta, setOsLiveMeta] = useState<{
+    online: boolean;
+    total_label: string;
+    total_int: number;
+    fetched_count: number;
+    new_not_in_local: number;
+    search_url: string;
+    error?: string;
+    results?: Array<Record<string, unknown>>;
   } | null>(null);
   const [wikiranSyncNote, setWikiranSyncNote] = useState<string | null>(null);
   const [ofacStatusNote, setOfacStatusNote] = useState<string | null>(null);
@@ -529,6 +560,40 @@ export default function App() {
   // Helper to highlight search query terms with a bold yellow background inside summaries and excerpts
   const highlightSearchTerms = (text: string, rawQuery: string): React.ReactNode => {
     if (!text) return '';
+    const trimmed = (rawQuery || '').trim();
+    const isQuoted = trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
+    const cleanPhrase = isQuoted ? trimmed.slice(1, -1).trim() : trimmed;
+
+    if ((exactMatch || isQuoted) && cleanPhrase) {
+      const escapedPhrase = cleanPhrase
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('\\s+');
+      if (escapedPhrase) {
+        const prefix = /^\w/.test(cleanPhrase) ? '(?<!\\w)' : '';
+        const suffix = /\w$/.test(cleanPhrase) ? '(?!\\w)' : '';
+        try {
+          const exactRegex = new RegExp(`(${prefix}${escapedPhrase}${suffix})`, 'gi');
+          const parts = text.split(exactRegex);
+          return parts.map((part, idx) =>
+            idx % 2 === 1 ? (
+              <mark
+                key={idx}
+                className="bg-yellow-300 text-slate-950 font-bold px-1 rounded-xs"
+              >
+                {part}
+              </mark>
+            ) : (
+              <React.Fragment key={idx}>{part}</React.Fragment>
+            )
+          );
+        } catch {
+          // Fall through to standard token highlighting if regex lookbehind is unsupported
+        }
+      }
+    }
+
     const cleaned = (rawQuery || '')
       .replace(/["*]/g, ' ')
       .split(/\s+/)
@@ -903,7 +968,10 @@ export default function App() {
       type?: string;
       from?: string;
       to?: string;
+      exact?: boolean;
       includeLive?: boolean;
+      includeLiveOfac?: boolean;
+      includeLiveOs?: boolean;
       leakSource?: string;
     }
   ) => {
@@ -913,7 +981,10 @@ export default function App() {
     const targetType = opts?.type ?? filterType;
     const targetFrom = opts?.from ?? filterDateFrom;
     const targetTo = opts?.to ?? filterDateTo;
-    const targetLive = (opts?.includeLive ?? includeLiveWikIran) && !isOffline;
+    const targetExact = opts?.exact ?? exactMatch;
+    const targetLiveWikIran = (opts?.includeLive ?? includeLiveWikIran) && !isOffline;
+    const targetLiveOfac = (opts?.includeLiveOfac ?? includeLiveOfac) && !isOffline;
+    const targetLiveOs = (opts?.includeLiveOs ?? includeLiveOpenSanctions) && !isOffline;
     const targetLeakSource = opts?.leakSource !== undefined ? opts.leakSource : activeLeakSourceFilter;
 
     try {
@@ -922,12 +993,15 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: q,
+          exact_match: targetExact,
           category_slug: targetCategory === 'ALL' ? null : targetCategory,
           organization_name: targetOrg === 'ALL' ? null : targetOrg,
           source_type: targetType === 'ALL' ? null : targetType,
           date_from: targetFrom || null,
           date_to: targetTo || null,
-          include_live_wikiran: targetLive,
+          include_live_wikiran: targetLiveWikIran,
+          include_live_ofac: targetLiveOfac,
+          include_live_opensanctions: targetLiveOs,
           leak_source: targetLeakSource || null,
           live_pages: 2,
         }),
@@ -936,6 +1010,8 @@ export default function App() {
       if (json.ok) {
         setSearchResults(json.results);
         setWikiranLiveMeta(json.wikiran_live || null);
+        setOfacLiveMeta(json.ofac_live || null);
+        setOsLiveMeta(json.opensanctions_live || null);
       }
     } catch {
       // Offline fallback over cached local SQLite records if browser network is completely severed
@@ -2329,25 +2405,39 @@ export default function App() {
                       : 0;
 
                   return (
-                    <div className="p-4 sm:p-5 bg-slate-100/70 border-b border-slate-200">
+                    <div className="p-4 sm:p-5 bg-slate-100/80 border-b border-slate-200">
                       <div
-                        className={`rounded-xl bg-slate-950 text-slate-100 p-4 sm:p-5 space-y-4 transition-all ${
+                        className={`relative rounded-2xl bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 p-5 sm:p-6 space-y-5 overflow-hidden transition-all ${
                           isRunningJob
-                            ? 'border-2 border-emerald-400 shadow-lg ring-4 ring-emerald-500/15'
-                            : 'border-2 border-slate-700 shadow-md'
+                            ? 'border-2 border-emerald-400 shadow-xl ring-4 ring-emerald-500/15'
+                            : 'border border-slate-700/90 shadow-lg ring-1 ring-inset ring-white/5'
                         }`}
                       >
-                        {/* Top Bar: Animated CSS Radar + Title + Elapsed + 4 Action Buttons */}
-                        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                          <div className="flex items-center gap-3.5 min-w-0">
+                        {/* Subtle top architectural hairline */}
+                        <div
+                          className={`absolute inset-x-0 top-0 h-0.5 ${
+                            isRunningJob
+                              ? 'bg-gradient-to-r from-emerald-400 via-sky-400 to-indigo-400'
+                              : 'bg-gradient-to-r from-indigo-500/70 via-sky-400/70 to-emerald-500/70'
+                          }`}
+                        />
+
+                        {/* Tier 1: Radar Visual Indicator + Status Title + Live Telemetry Readout */}
+                        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                          <div className="flex items-center gap-4 min-w-0">
                             {/* CSS-Animated Spider Radar Visual Indicator */}
-                            <div className="relative w-14 h-14 shrink-0 flex items-center justify-center rounded-xl bg-slate-900 border border-slate-700/90 shadow-inner overflow-hidden">
+                            <div
+                              className={`relative w-16 h-16 shrink-0 flex items-center justify-center rounded-xl bg-slate-950 shadow-inner overflow-hidden ${
+                                isRunningJob
+                                  ? 'border border-emerald-400/60 ring-2 ring-emerald-500/20'
+                                  : 'border border-slate-700/90'
+                              }`}
+                            >
                               <svg
                                 viewBox="0 0 64 64"
-                                className="w-12 h-12"
+                                className="w-13 h-13"
                                 aria-hidden="true"
                               >
-                                {/* Concentric Web Rings */}
                                 <circle
                                   cx="32"
                                   cy="32"
@@ -2355,7 +2445,7 @@ export default function App() {
                                   fill="none"
                                   stroke={isRunningJob ? '#10B981' : '#475569'}
                                   strokeWidth="1"
-                                  strokeOpacity="0.35"
+                                  strokeOpacity="0.4"
                                 />
                                 <circle
                                   cx="32"
@@ -2365,7 +2455,7 @@ export default function App() {
                                   stroke={isRunningJob ? '#38BDF8' : '#475569'}
                                   strokeWidth="1"
                                   strokeDasharray="3 3"
-                                  strokeOpacity="0.45"
+                                  strokeOpacity="0.5"
                                 />
                                 <circle
                                   cx="32"
@@ -2374,9 +2464,8 @@ export default function App() {
                                   fill="none"
                                   stroke={isRunningJob ? '#10B981' : '#64748B'}
                                   strokeWidth="1"
-                                  strokeOpacity="0.55"
+                                  strokeOpacity="0.6"
                                 />
-                                {/* Web Spokes */}
                                 <line x1="32" y1="6" x2="32" y2="58" stroke="#334155" strokeWidth="0.9" />
                                 <line x1="6" y1="32" x2="58" y2="32" stroke="#334155" strokeWidth="0.9" />
                                 <line x1="13" y1="13" x2="51" y2="51" stroke="#334155" strokeWidth="0.8" />
@@ -2384,7 +2473,6 @@ export default function App() {
 
                                 {isRunningJob && (
                                   <>
-                                    {/* Expanding Radar Pulses */}
                                     <circle
                                       cx="32"
                                       cy="32"
@@ -2403,7 +2491,6 @@ export default function App() {
                                       strokeWidth="1.5"
                                       className="animate-spider-pulse-2"
                                     />
-                                    {/* Rotating Radar Sweep Wedge */}
                                     <g className="animate-spider-radar">
                                       <path
                                         d="M32 32 L32 6 A26 26 0 0 1 54.5 19 Z"
@@ -2419,13 +2506,11 @@ export default function App() {
                                         strokeLinecap="round"
                                       />
                                     </g>
-                                    {/* Pulsing Target Nodes on the Spider Web */}
                                     <circle cx="44" cy="19" r="2.6" fill="#34D399" className="animate-spider-node-a" />
                                     <circle cx="19" cy="41" r="2.4" fill="#38BDF8" className="animate-spider-node-b" />
                                     <circle cx="46" cy="43" r="2.2" fill="#FBBF24" className="animate-spider-node-c" />
                                   </>
                                 )}
-                                {/* Center Spider Core */}
                                 <circle
                                   cx="32"
                                   cy="32"
@@ -2435,13 +2520,13 @@ export default function App() {
                               </svg>
                             </div>
 
-                            <div className="min-w-0 space-y-1">
+                            <div className="min-w-0 space-y-1.5">
                               <div className="flex flex-wrap items-center gap-2">
                                 <span
-                                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-extrabold uppercase tracking-wider ${
+                                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-extrabold uppercase tracking-wider ${
                                     isRunningJob
                                       ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/50'
-                                      : 'bg-slate-800 text-sky-300 border border-slate-600'
+                                      : 'bg-sky-500/15 text-sky-300 border border-sky-400/35'
                                   }`}
                                 >
                                   <span
@@ -2452,94 +2537,169 @@ export default function App() {
                                   {isRunningJob
                                     ? lang === 'fa'
                                       ? 'خزنده زنده فعال است'
-                                      : 'ACTIVE SPIDER RUNNING'
+                                      : 'ACTIVE SPIDER · RUNNING'
                                     : lang === 'fa'
-                                    ? 'مانیتور خزنده آماده (Standby)'
+                                    ? 'مانیتور خزنده · آماده اجرا'
                                     : 'ACTIVE SPIDER MONITOR · READY'}
                                 </span>
                                 {isRunningJob && (
-                                  <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono-tabular text-xs font-bold text-sky-300">
+                                  <span className="px-2.5 py-0.5 rounded-md bg-slate-950 border border-slate-700 font-mono-tabular text-xs font-bold text-emerald-300">
                                     {String(Math.floor(crawlElapsedSec / 60)).padStart(2, '0')}:
                                     {String(crawlElapsedSec % 60).padStart(2, '0')}
                                   </span>
                                 )}
                               </div>
-                              <div className="text-sm sm:text-base font-bold text-white tracking-tight truncate">
+                              <h3 className="text-base sm:text-lg font-bold text-white tracking-tight leading-snug">
                                 {isRunningJob
                                   ? crawlModeLabel ||
                                     (lang === 'fa'
                                       ? 'خزش عمیق در wikiran.org'
                                       : 'Deep Spidering wikiran.org')
                                   : lang === 'fa'
-                                  ? 'کنترل ۴گانه خزنده: کشف مسیر جدید · خزش عمیق · بررسی آپدیت · توقف'
-                                  : '4-Mode Spider Engine: Discover New · Deep Crawl · Check Updates · Stop'}
-                              </div>
+                                  ? 'موتور ۴گانه خزش و به‌روزرسانی آرشیو ویکی‌ایران'
+                                  : '4-Mode WikIran Spider & Incremental Update Engine'}
+                              </h3>
+                              <p className="text-xs text-slate-400 leading-relaxed">
+                                {lang === 'fa'
+                                  ? 'صف مسیرهای جدید را اسکن کنید، تا عمق لینک‌ها خزش نمایید، مسیرهای قدیمی را بررسی کنید یا در هر لحظه ایمن متوقف شوید.'
+                                  : 'Discover unseen sitemap/leak paths, deep-crawl new URLs without repeating archived pages, check existing records for updates, or halt safely at a checkpoint.'}
+                              </p>
                             </div>
                           </div>
 
-                          {/* 4 Distinct Required Spider Buttons */}
-                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {/* Compact Engine Readiness Stamp */}
+                          <div className="shrink-0 flex md:flex-col items-center md:items-end justify-between gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-950/90 border border-slate-800 text-xs">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              {lang === 'fa' ? 'وضعیت صف خزنده' : 'SPIDER STATUS'}
+                            </span>
+                            <span
+                              className={`font-mono-tabular font-bold text-xs ${
+                                isRunningJob ? 'text-emerald-400' : 'text-sky-300'
+                              }`}
+                            >
+                              {isRunningJob
+                                ? `${pct}% · ${processed.toLocaleString()} done`
+                                : pendingFrontier > 0
+                                ? lang === 'fa'
+                                  ? `${pendingFrontier.toLocaleString()} لینک آماده خزش`
+                                  : `${pendingFrontier.toLocaleString()} URLs queued`
+                                : lang === 'fa'
+                                ? 'آماده کشف مسیر جدید'
+                                : 'Standby · Ready'}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Tier 2: Dedicated Symmetric 4-Button Command Dock */}
+                        <div className="rounded-xl bg-slate-950/85 border border-slate-800/95 p-2.5">
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
                             <button
                               type="button"
                               onClick={() => handleUpdateArchive(undefined, 25, true, 'discover')}
                               disabled={isRunningJob}
-                              className="px-3.5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              className="group relative flex items-center gap-3 w-full px-3.5 py-3 text-start rounded-lg bg-indigo-600/95 hover:bg-indigo-500 border border-indigo-400/40 text-white transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                               title={
                                 lang === 'fa'
                                   ? 'اسکن عمیق نقشه سایت، اسناد و صفحات جدید لیک‌ها برای کشف مسیرهای دانلودنشده'
                                   : 'Scan sitemaps, documents & deep leak pagination to discover brand-new unseen paths'
                               }
                             >
-                              <Search className="w-3.5 h-3.5 shrink-0" />
-                              <span>{lang === 'fa' ? '۱. کشف مسیر جدید' : '1. Discover'}</span>
+                              <span className="w-8 h-8 rounded-lg bg-indigo-950/60 border border-indigo-300/30 flex items-center justify-center shrink-0">
+                                <Search className="w-4 h-4 text-indigo-100" />
+                              </span>
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold tracking-tight truncate">
+                                  {lang === 'fa' ? '۱. کشف مسیر جدید' : '1. Discover'}
+                                </div>
+                                <div className="text-[11px] text-indigo-100/80 truncate">
+                                  {lang === 'fa' ? 'یافتن لینک‌های جدید' : 'Find unseen paths'}
+                                </div>
+                              </div>
                             </button>
 
                             <button
                               type="button"
                               onClick={() => handleUpdateArchive(undefined, 120, true, 'deep_spider')}
                               disabled={isRunningJob}
-                              className="px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              className="group relative flex items-center gap-3 w-full px-3.5 py-3 text-start rounded-lg bg-emerald-600/95 hover:bg-emerald-500 border border-emerald-400/40 text-white transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                               title={
                                 lang === 'fa'
                                   ? 'خزش عمیق تا انتهای مسیرهای جدید کشف‌شده بدون تکرار موارد قبلی'
                                   : 'Crawl deeply through unseen frontier paths & nested links without repeating archived items'
                               }
                             >
-                              <Activity className="w-3.5 h-3.5 shrink-0" />
-                              <span>{lang === 'fa' ? '۲. خزش عمیق (Spider)' : '2. Deep Spider'}</span>
+                              <span className="w-8 h-8 rounded-lg bg-emerald-950/60 border border-emerald-300/30 flex items-center justify-center shrink-0">
+                                <Activity className="w-4 h-4 text-emerald-100" />
+                              </span>
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold tracking-tight truncate">
+                                  {lang === 'fa' ? '۲. خزش عمیق' : '2. Deep Spider'}
+                                </div>
+                                <div className="text-[11px] text-emerald-100/80 truncate">
+                                  {lang === 'fa' ? 'استخراج کامل صف' : 'Crawl deep queue'}
+                                </div>
+                              </div>
                             </button>
 
                             <button
                               type="button"
                               onClick={() => handleUpdateArchive(undefined, 25, false, 'check_updates')}
                               disabled={isRunningJob}
-                              className="px-3.5 py-2 text-xs font-bold text-white bg-sky-600 hover:bg-sky-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shadow-xs"
+                              className="group relative flex items-center gap-3 w-full px-3.5 py-3 text-start rounded-lg bg-sky-600/95 hover:bg-sky-500 border border-sky-400/40 text-white transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                               title={
                                 lang === 'fa'
                                   ? 'فقط بررسی مسیرهای قدیمی و صفحه اول جهت یافتن تغییرات و آپدیت‌های جدید'
                                   : 'Only re-check older downloaded paths & front feeds for modified/new records'
                               }
                             >
-                              <RefreshCw
-                                className={`w-3.5 h-3.5 shrink-0 ${
-                                  isRunningJob ? 'animate-spin' : ''
-                                }`}
-                              />
-                              <span>{lang === 'fa' ? '۳. بررسی آپدیت' : '3. Check Updates'}</span>
+                              <span className="w-8 h-8 rounded-lg bg-sky-950/60 border border-sky-300/30 flex items-center justify-center shrink-0">
+                                <RefreshCw
+                                  className={`w-4 h-4 text-sky-100 ${
+                                    isRunningJob ? 'animate-spin' : ''
+                                  }`}
+                                />
+                              </span>
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold tracking-tight truncate">
+                                  {lang === 'fa' ? '۳. بررسی آپدیت' : '3. Check Updates'}
+                                </div>
+                                <div className="text-[11px] text-sky-100/80 truncate">
+                                  {lang === 'fa' ? 'چک کردن مسیرهای قبلی' : 'Re-verify archived'}
+                                </div>
+                              </div>
                             </button>
 
                             <button
                               type="button"
                               onClick={handleStopCrawl}
                               disabled={!isRunningJob}
-                              className={`px-3.5 py-2 text-xs font-bold rounded-lg transition-all inline-flex items-center gap-1.5 ${
+                              className={`flex items-center gap-3 w-full px-3.5 py-3 text-start rounded-lg transition-all ${
                                 isRunningJob
-                                  ? 'bg-rose-600 hover:bg-rose-500 text-white cursor-pointer shadow-md ring-2 ring-rose-400/60'
-                                  : 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
+                                  ? 'bg-rose-600 hover:bg-rose-500 border border-rose-400/60 text-white cursor-pointer shadow-md ring-2 ring-rose-400/40'
+                                  : 'bg-slate-900 border border-slate-700/90 text-slate-400 cursor-not-allowed'
                               }`}
                             >
-                              <Square className="w-3 h-3 fill-current shrink-0" />
-                              <span>{lang === 'fa' ? '۴. توقف (Stop)' : '4. Stop'}</span>
+                              <span
+                                className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                                  isRunningJob
+                                    ? 'bg-rose-950/60 border border-rose-300/40 text-white'
+                                    : 'bg-slate-800/90 border border-slate-700 text-slate-500'
+                                }`}
+                              >
+                                <Square className="w-3.5 h-3.5 fill-current" />
+                              </span>
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold tracking-tight truncate">
+                                  {lang === 'fa' ? '۴. توقف ایمن' : '4. Stop'}
+                                </div>
+                                <div
+                                  className={`text-[11px] truncate ${
+                                    isRunningJob ? 'text-rose-100/85' : 'text-slate-500'
+                                  }`}
+                                >
+                                  {lang === 'fa' ? 'ذخیره و توقف' : 'Save checkpoint'}
+                                </div>
+                              </div>
                             </button>
                           </div>
                         </div>
@@ -2560,18 +2720,18 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* High-Contrast Live Metrics Strip */}
+                        {/* Tier 3: High-Contrast Live Metrics Strip */}
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                          <div className="bg-slate-900/90 border border-slate-800 border-t-2 border-t-indigo-400/70 rounded-xl px-4 py-3">
                             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                               {lang === 'fa' ? 'مسیرهای جدید در صف' : 'Unseen Frontier Queue'}
                             </div>
-                            <div className="text-xl font-extrabold font-mono-tabular text-indigo-300 mt-1">
+                            <div className="text-2xl font-extrabold font-mono-tabular text-indigo-300 mt-1">
                               {pendingFrontier.toLocaleString()}
                             </div>
                           </div>
 
-                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                          <div className="bg-slate-900/90 border border-slate-800 border-t-2 border-t-sky-400/70 rounded-xl px-4 py-3">
                             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                               {isRunningJob
                                 ? lang === 'fa'
@@ -2581,26 +2741,26 @@ export default function App() {
                                 ? 'مسیرهای بررسی‌شده'
                                 : 'Frontier Crawled'}
                             </div>
-                            <div className="text-xl font-extrabold font-mono-tabular text-sky-300 mt-1">
+                            <div className="text-2xl font-extrabold font-mono-tabular text-sky-300 mt-1">
                               {processed.toLocaleString()}
                               {isRunningJob && discovered > 0 ? ` / ${discovered}` : ''}
                             </div>
                           </div>
 
-                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                          <div className="bg-slate-900/90 border border-slate-800 border-t-2 border-t-emerald-400/70 rounded-xl px-4 py-3">
                             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                               {lang === 'fa' ? 'رکورد جدید ذخیره‌شده' : 'New Saved (Run)'}
                             </div>
-                            <div className="text-xl font-extrabold font-mono-tabular text-emerald-400 mt-1">
+                            <div className="text-2xl font-extrabold font-mono-tabular text-emerald-400 mt-1">
                               +{newRecs.toLocaleString()}
                             </div>
                           </div>
 
-                          <div className="bg-slate-900/95 border border-slate-700/90 rounded-lg px-3.5 py-2.5">
+                          <div className="bg-slate-900/90 border border-slate-800 border-t-2 border-t-amber-400/70 rounded-xl px-4 py-3">
                             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                               {lang === 'fa' ? 'کل آرشیو ویکی‌ایران' : 'WikIran Archived'}
                             </div>
-                            <div className="text-xl font-extrabold font-mono-tabular text-amber-300 mt-1">
+                            <div className="text-2xl font-extrabold font-mono-tabular text-amber-300 mt-1">
                               {(
                                 (liveCrawlStatus?.articles_count ?? data.stats.articles_count) +
                                 (liveCrawlStatus?.publications_count ??
@@ -3542,25 +3702,71 @@ export default function App() {
                 onSubmit={handleSearch}
                 className="bg-white border-2 border-indigo-200 rounded-xl p-4 sm:p-6 space-y-4 shadow-2xs"
               >
-                <div className="flex flex-col md:flex-row gap-3">
+                <div className="flex flex-col md:flex-row gap-2.5">
                   <input
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder={t.searchPlaceholder}
-                    className="flex-1 px-3.5 py-2.5 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                    placeholder={
+                      exactMatch
+                        ? lang === 'fa'
+                          ? 'جستجوی دقیق کلمه یا عبارت (مثلاً: Bank Sepah یا Sepah — بدون تطابق‌های جزئی)...'
+                          : 'Exact word or phrase (e.g. "Bank Sepah" or "Sepah" — skips partial words like "Sepahan")...'
+                        : t.searchPlaceholder
+                    }
+                    className={`flex-1 px-3.5 py-2.5 text-sm border rounded-md focus:outline-none focus:ring-2 ${
+                      exactMatch
+                        ? 'border-amber-500 bg-amber-50/40 focus:ring-amber-500 font-medium'
+                        : 'border-slate-300 focus:ring-indigo-600'
+                    }`}
                   />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextExact = !exactMatch;
+                      setExactMatch(nextExact);
+                      if (searchQuery.trim()) {
+                        runUniversalSearchWithQuery(searchQuery, { exact: nextExact });
+                      }
+                    }}
+                    title={
+                      lang === 'fa'
+                        ? 'فقط تطابق دقیق کل کلمه یا عبارت (مثلاً Sepah دیگر Sepahan را نمی‌آورد)'
+                        : 'Match exact whole word or exact phrase only (e.g. "Sepah" will NOT match "Sepahan")'
+                    }
+                    className={`px-3.5 py-2.5 text-xs font-bold rounded-md border transition-all inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer ${
+                      exactMatch
+                        ? 'bg-amber-600 text-white border-amber-700 shadow-xs'
+                        : 'bg-white text-slate-700 border-slate-300 hover:bg-amber-50 hover:border-amber-400 hover:text-amber-900'
+                    }`}
+                  >
+                    <span className="font-mono-tabular text-sm leading-none">&ldquo;&rdquo;</span>
+                    <span>
+                      {lang === 'fa'
+                        ? exactMatch
+                          ? 'تطابق دقیق فعال'
+                          : 'جستجوی دقیق کلمه'
+                        : exactMatch
+                        ? 'Exact Word: ON'
+                        : 'Exact Word / Phrase'}
+                    </span>
+                  </button>
                   <button
                     type="submit"
                     disabled={busyAction === 'search'}
-                    className="px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-md hover:bg-indigo-700 transition-colors whitespace-nowrap cursor-pointer"
+                    className="px-5 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-md hover:bg-indigo-700 transition-colors whitespace-nowrap cursor-pointer disabled:opacity-60"
                   >
-                    {t.btnSearch}
+                    {busyAction === 'search'
+                      ? lang === 'fa'
+                        ? 'در حال جستجو...'
+                        : 'Searching...'
+                      : t.btnSearch}
                   </button>
                   <button
                     type="button"
                     onClick={() => {
                       setSearchQuery('');
+                      setExactMatch(false);
                       setFilterCategory('ALL');
                       setFilterOrg('ALL');
                       setFilterType('ALL');
@@ -3568,6 +3774,8 @@ export default function App() {
                       setFilterDateTo('');
                       setActiveLeakSourceFilter('');
                       setWikiranLiveMeta(null);
+                      setOfacLiveMeta(null);
+                      setOsLiveMeta(null);
                       setSearchResults(null);
                     }}
                     className="px-4 py-2.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
@@ -3576,43 +3784,141 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Live Full-Archive WikIran Server Toggle (searches all 500,000+ emails, files, Front Companies & Vessels) */}
-                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-indigo-50/70 border border-indigo-200 text-xs">
-                  <label className="inline-flex items-center gap-2 font-semibold text-indigo-950 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={includeLiveWikIran && !isOffline}
-                      disabled={isOffline}
-                      onChange={(e) => {
-                        const next = e.target.checked;
-                        setIncludeLiveWikIran(next);
-                        if (searchQuery.trim()) {
-                          runUniversalSearchWithQuery(searchQuery, { includeLive: next });
-                        }
-                      }}
-                      className="w-4 h-4 accent-indigo-700 rounded cursor-pointer"
-                    />
-                    <span>
+                {exactMatch && (
+                  <div className="px-3 py-2 rounded-md bg-amber-50 border border-amber-300 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-semibold">
                       {lang === 'fa'
-                        ? 'جستجوی همزمان در کل آرشیو زنده WikIran.org (بیش از ۵۰۰٬۰۰۰ ایمیل، سند، شرکت پوششی و کشتی + ذخیره خودکار آفلاین)'
-                        : 'Also query Live WikIran.org Full Archive (500,000+ leaked emails, PDFs, Front Companies & Vessels — auto-saves hits offline)'}
+                        ? 'حالت تطابق دقیق کلمه / عبارت فعال است: فقط نتایجی نمایش داده می‌شوند که دقیقاً شامل همین کلمه یا عبارت باشند (تطابق‌های جزئی حذف می‌شوند).'
+                        : 'Exact Word / Phrase Mode Active: Only records containing the exact whole word or exact consecutive phrase are shown across Offline SQLite + Live OFAC + Live OpenSanctions + Live WikIran.'}
                     </span>
-                  </label>
-                  <span
-                    className={`px-2 py-0.5 rounded font-bold text-[10px] uppercase ${
-                      isOffline
-                        ? 'bg-slate-200 text-slate-600'
-                        : includeLiveWikIran
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-slate-200 text-slate-700'
-                    }`}
-                  >
-                    {isOffline
-                      ? 'Offline (Local Only)'
-                      : includeLiveWikIran
-                      ? 'Live + Offline Active'
-                      : 'Offline Only'}
-                  </span>
+                    <span className="font-mono-tabular text-[11px] text-amber-800">
+                      Tip: &quot;word&quot; also enables exact mode
+                    </span>
+                  </div>
+                )}
+
+                {/* 3-Source Parallel Live Search Strip: OFAC + OpenSanctions + WikIran 3.1M */}
+                <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-700">
+                      {lang === 'fa'
+                        ? 'استعلام همزمان زنده (آنلاین + دیتابیس آفلاین):'
+                        : 'Simultaneous Live Portal Queries (Runs in Parallel with Offline DB):'}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-bold text-[10px] uppercase ${
+                        isOffline
+                          ? 'bg-slate-200 text-slate-600'
+                          : includeLiveOfac || includeLiveOpenSanctions || includeLiveWikIran
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {isOffline
+                        ? 'Offline (Local Only)'
+                        : `${
+                            [includeLiveOfac, includeLiveOpenSanctions, includeLiveWikIran].filter(
+                              Boolean
+                            ).length
+                          }/3 Live Portals Active`}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    {/* 1. Live OFAC Toggle */}
+                    <label
+                      className={`flex items-start gap-2.5 p-2.5 rounded-lg border text-xs cursor-pointer transition-colors ${
+                        includeLiveOfac && !isOffline
+                          ? 'bg-rose-50/80 border-rose-300 text-rose-950'
+                          : 'bg-white border-slate-200 text-slate-600'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={includeLiveOfac && !isOffline}
+                        disabled={isOffline}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setIncludeLiveOfac(next);
+                          if (searchQuery.trim()) {
+                            runUniversalSearchWithQuery(searchQuery, { includeLiveOfac: next });
+                          }
+                        }}
+                        className="w-4 h-4 mt-0.5 accent-rose-700 rounded cursor-pointer shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-bold text-rose-950">
+                          {lang === 'fa' ? 'استعلام زنده اوفک (OFAC Live)' : 'Live OFAC (U.S. Treasury)'}
+                        </div>
+                        <div className="text-[11px] text-slate-600 truncate">
+                          sanctionssearch.ofac.treas.gov
+                        </div>
+                      </div>
+                    </label>
+
+                    {/* 2. Live OpenSanctions Toggle */}
+                    <label
+                      className={`flex items-start gap-2.5 p-2.5 rounded-lg border text-xs cursor-pointer transition-colors ${
+                        includeLiveOpenSanctions && !isOffline
+                          ? 'bg-amber-50/80 border-amber-300 text-amber-950'
+                          : 'bg-white border-slate-200 text-slate-600'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={includeLiveOpenSanctions && !isOffline}
+                        disabled={isOffline}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setIncludeLiveOpenSanctions(next);
+                          if (searchQuery.trim()) {
+                            runUniversalSearchWithQuery(searchQuery, { includeLiveOs: next });
+                          }
+                        }}
+                        className="w-4 h-4 mt-0.5 accent-amber-600 rounded cursor-pointer shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-bold text-amber-950">
+                          {lang === 'fa'
+                            ? 'استعلام زنده OpenSanctions'
+                            : 'Live OpenSanctions (Global)'}
+                        </div>
+                        <div className="text-[11px] text-slate-600 truncate">
+                          opensanctions.org/search (UN, EU, UK, US)
+                        </div>
+                      </div>
+                    </label>
+
+                    {/* 3. Live WikIran Toggle */}
+                    <label
+                      className={`flex items-start gap-2.5 p-2.5 rounded-lg border text-xs cursor-pointer transition-colors ${
+                        includeLiveWikIran && !isOffline
+                          ? 'bg-indigo-50/80 border-indigo-300 text-indigo-950'
+                          : 'bg-white border-slate-200 text-slate-600'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={includeLiveWikIran && !isOffline}
+                        disabled={isOffline}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setIncludeLiveWikIran(next);
+                          if (searchQuery.trim()) {
+                            runUniversalSearchWithQuery(searchQuery, { includeLive: next });
+                          }
+                        }}
+                        className="w-4 h-4 mt-0.5 accent-indigo-700 rounded cursor-pointer shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-bold text-indigo-950">
+                          {lang === 'fa' ? 'استعلام زنده WikIran 3.1M' : 'Live WikIran Full Archive'}
+                        </div>
+                        <div className="text-[11px] text-slate-600 truncate">
+                          wikiran.org/search (auto-saves offline)
+                        </div>
+                      </div>
+                    </label>
+                  </div>
                 </div>
 
                 {/* Instant Sample Deep-Search Chips (Emails, Banking IBANs, Files, Companies) */}
@@ -3693,10 +3999,16 @@ export default function App() {
                   >
                     <option value="ALL">{t.filterSourceType}</option>
                     <option value="OFAC_SANCTION">
-                      OFAC Sanctions Lists (SDN + Non-SDN Consolidated)
+                      OFAC Sanctions Lists (Offline SDN + Non-SDN)
+                    </option>
+                    <option value="OFAC_LIVE">
+                      OFAC Live Portal (sanctionssearch.ofac.treas.gov)
                     </option>
                     <option value="OPENSANCTIONS">
-                      OpenSanctions Global Consolidated (UN, EU, UK, US, CA, AU, CH)
+                      OpenSanctions Global (Offline Consolidated)
+                    </option>
+                    <option value="OPENSANCTIONS_LIVE">
+                      OpenSanctions Live Portal (opensanctions.org)
                     </option>
                     <option value="WIKIRAN_DOC">
                       WikIran Front Companies, Vessels & Cached Leak Docs
@@ -3842,20 +4154,34 @@ export default function App() {
 
               {(() => {
                 const ofacMatches = displayedSearchResults.filter(
-                  (r) => r.record_type === 'OFAC_SANCTION'
+                  (r) => r.record_type === 'OFAC_SANCTION' || r.record_type === 'OFAC_LIVE'
                 );
                 const osMatches = displayedSearchResults.filter(
-                  (r) => r.record_type === 'OPENSANCTIONS'
+                  (r) => r.record_type === 'OPENSANCTIONS' || r.record_type === 'OPENSANCTIONS_LIVE'
                 );
                 const wikiranMatches = displayedSearchResults.filter(
-                  (r) => r.record_type !== 'OFAC_SANCTION' && r.record_type !== 'OPENSANCTIONS'
+                  (r) =>
+                    r.record_type !== 'OFAC_SANCTION' &&
+                    r.record_type !== 'OFAC_LIVE' &&
+                    r.record_type !== 'OPENSANCTIONS' &&
+                    r.record_type !== 'OPENSANCTIONS_LIVE'
                 );
-                const totalSanctionsHits = ofacMatches.length + osMatches.length;
+                const ofacLiveRows = ofacLiveMeta?.results || [];
+                const osLiveRows = osLiveMeta?.results || [];
+                const totalSanctionsHits =
+                  ofacMatches.length +
+                  osMatches.length +
+                  (ofacMatches.length === 0 ? ofacLiveRows.length : 0) +
+                  (osMatches.length === 0 ? osLiveRows.length : 0);
                 const scopedResults =
                   searchScopeTab === 'OFAC'
                     ? ofacMatches
+                    : searchScopeTab === 'OFAC_LIVE'
+                    ? ofacLiveRows
                     : searchScopeTab === 'OPENSANCTIONS'
                     ? osMatches
+                    : searchScopeTab === 'OPENSANCTIONS_LIVE'
+                    ? osLiveRows
                     : searchScopeTab === 'WIKIRAN'
                     ? wikiranMatches
                     : displayedSearchResults;
@@ -3881,16 +4207,16 @@ export default function App() {
                             <div className="text-xs sm:text-sm font-bold">
                               {totalSanctionsHits > 0
                                 ? lang === 'fa'
-                                  ? `هشدار تحریم تجاری: ${ofacMatches.length} تطابق در اوفک (OFAC) و ${osMatches.length} تطابق در OpenSanctions جهانی یافت شد!`
+                                  ? `هشدار تحریم تجاری: ${ofacMatches.length} تطابق OFAC و ${osMatches.length} تطابق OpenSanctions یافت شد!`
                                   : `SANCTIONS SCREENING ALERT: ${ofacMatches.length} OFAC + ${osMatches.length} OpenSanctions Match(es) Found!`
                                 : lang === 'fa'
                                 ? `بدون تطابق تحریمی در ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} رکورد OFAC و ${Number(data.opensanctions_summary?.total_entities || 0).toLocaleString()} رکورد OpenSanctions`
-                                : `Sanctions Clear: 0 Hits across ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} OFAC & ${Number(data.opensanctions_summary?.total_entities || 0).toLocaleString()} OpenSanctions offline records`}
+                                : `Sanctions Clear: 0 Hits across ${Number(data.ofac_summary?.total_entities || 0).toLocaleString()} OFAC & ${Number(data.opensanctions_summary?.total_entities || 0).toLocaleString()} OpenSanctions records`}
                             </div>
                             <div className="text-[11px] opacity-85">
                               {lang === 'fa'
-                                ? `آرشیو ویکی‌ایران: ${wikiranMatches.length} رکورد · اوفک #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}`
-                                : `WikIran Archive: ${wikiranMatches.length} records · OFAC Pub #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}`}
+                                ? `آرشیو ویکی‌ایران: ${wikiranMatches.length} رکورد · اوفک #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}${exactMatch ? ' · حالت تطابق دقیق' : ''}`
+                                : `WikIran Archive: ${wikiranMatches.length} records · OFAC Pub #${data.ofac_summary?.last_publication_id || '—'} · OpenSanctions ${data.opensanctions_summary?.last_change?.slice(0, 10) || '—'}${exactMatch ? ' · Exact Word/Phrase Mode' : ''}`}
                             </div>
                           </div>
                         </div>
@@ -3941,6 +4267,123 @@ export default function App() {
                             WikIran ({wikiranMatches.length})
                           </button>
                         </div>
+                      </div>
+                    )}
+
+                    {/* Live OFAC + Live OpenSanctions Real-Time Verification Strip */}
+                    {(ofacLiveMeta || osLiveMeta) && Boolean(searchQuery.trim()) && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {ofacLiveMeta && (
+                          <div className="rounded-lg border-2 border-rose-300 bg-rose-50/75 p-3 flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-0.5 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-rose-700 text-white rounded">
+                                  {ofacLiveMeta.online ? 'OFAC TREASURY LIVE' : 'OFAC LIVE OFFLINE'}
+                                </span>
+                                <span className="text-xs font-bold text-rose-950">
+                                  {ofacLiveMeta.online
+                                    ? lang === 'fa'
+                                      ? `${ofacLiveMeta.fetched_count} نتیجه زنده رسمی (${ofacLiveMeta.new_not_in_local} مورد جدید خارج از آفلاین)`
+                                      : `${ofacLiveMeta.total_label} (${ofacLiveMeta.new_not_in_local} new vs offline DB)`
+                                    : lang === 'fa'
+                                    ? 'سرور زنده اوفک در دسترس نیست'
+                                    : 'Live OFAC portal unreachable'}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {ofacLiveMeta.online && ofacLiveRows.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSearchScopeTab(
+                                      searchScopeTab === 'OFAC_LIVE' ? 'ALL' : 'OFAC_LIVE'
+                                    )
+                                  }
+                                  className={`px-2.5 py-1 text-[11px] font-bold rounded border cursor-pointer transition-colors ${
+                                    searchScopeTab === 'OFAC_LIVE'
+                                      ? 'bg-rose-700 text-white border-rose-700'
+                                      : 'bg-white text-rose-900 border-rose-300 hover:bg-rose-100'
+                                  }`}
+                                >
+                                  {searchScopeTab === 'OFAC_LIVE'
+                                    ? lang === 'fa'
+                                      ? 'نمایش همه'
+                                      : 'Show All'
+                                    : lang === 'fa'
+                                    ? `مشاهده ${ofacLiveRows.length} نتیجه زنده`
+                                    : `View ${ofacLiveRows.length} Live Hits`}
+                                </button>
+                              )}
+                              <a
+                                href={ofacLiveMeta.search_url || 'https://sanctionssearch.ofac.treas.gov/'}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="px-2 py-1 text-[11px] font-bold text-rose-900 bg-white hover:bg-rose-100 border border-rose-300 rounded inline-flex items-center gap-1"
+                              >
+                                <span>OFAC.gov</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                        )}
+
+                        {osLiveMeta && (
+                          <div className="rounded-lg border-2 border-amber-300 bg-amber-50/75 p-3 flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-0.5 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-amber-600 text-white rounded">
+                                  {osLiveMeta.online ? 'OPENSANCTIONS LIVE' : 'OPENSANCTIONS OFFLINE'}
+                                </span>
+                                <span className="text-xs font-bold text-amber-950">
+                                  {osLiveMeta.online
+                                    ? lang === 'fa'
+                                      ? `${osLiveMeta.fetched_count} نهاد زنده جهانی (${osLiveMeta.new_not_in_local} مورد جدید)`
+                                      : `${osLiveMeta.total_label} (${osLiveMeta.new_not_in_local} new vs offline DB)`
+                                    : lang === 'fa'
+                                    ? 'سرور زنده OpenSanctions در دسترس نیست'
+                                    : 'Live OpenSanctions unreachable'}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {osLiveMeta.online && osLiveRows.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSearchScopeTab(
+                                      searchScopeTab === 'OPENSANCTIONS_LIVE'
+                                        ? 'ALL'
+                                        : 'OPENSANCTIONS_LIVE'
+                                    )
+                                  }
+                                  className={`px-2.5 py-1 text-[11px] font-bold rounded border cursor-pointer transition-colors ${
+                                    searchScopeTab === 'OPENSANCTIONS_LIVE'
+                                      ? 'bg-amber-600 text-white border-amber-600'
+                                      : 'bg-white text-amber-950 border-amber-300 hover:bg-amber-100'
+                                  }`}
+                                >
+                                  {searchScopeTab === 'OPENSANCTIONS_LIVE'
+                                    ? lang === 'fa'
+                                      ? 'نمایش همه'
+                                      : 'Show All'
+                                    : lang === 'fa'
+                                    ? `مشاهده ${osLiveRows.length} نتیجه زنده`
+                                    : `View ${osLiveRows.length} Live Hits`}
+                                </button>
+                              )}
+                              <a
+                                href={osLiveMeta.search_url || 'https://www.opensanctions.org/search/'}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="px-2 py-1 text-[11px] font-bold text-amber-950 bg-white hover:bg-amber-100 border border-amber-300 rounded inline-flex items-center gap-1"
+                              >
+                                <span>OpenSanctions</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -4136,8 +4579,14 @@ export default function App() {
                           </thead>
                           <tbody className="divide-y divide-slate-200">
                             {scopedResults.map((row, idx) => {
-                              const isOfac = row.record_type === 'OFAC_SANCTION';
-                              const isOs = row.record_type === 'OPENSANCTIONS';
+                              const isOfac =
+                                row.record_type === 'OFAC_SANCTION' ||
+                                row.record_type === 'OFAC_LIVE';
+                              const isOfacLive = row.record_type === 'OFAC_LIVE';
+                              const isOs =
+                                row.record_type === 'OPENSANCTIONS' ||
+                                row.record_type === 'OPENSANCTIONS_LIVE';
+                              const isOsLive = row.record_type === 'OPENSANCTIONS_LIVE';
                               const isWikiranLive = row.record_type === 'WIKIRAN_LIVE';
                               const isWikiranDoc = row.record_type === 'WIKIRAN_DOC';
                               const wDocType = String((row as Record<string, unknown>).wikiran_doc_type || '');
@@ -4156,6 +4605,7 @@ export default function App() {
                               const ofacList = String((row as Record<string, unknown>).ofac_list_source || 'SDN');
                               const ofacType = String((row as Record<string, unknown>).ofac_sdn_type || '');
                               const ofacEntNum = (row as Record<string, unknown>).ofac_ent_num;
+                              const ofacMatchScore = String((row as Record<string, unknown>).ofac_match_score || '');
                               const osSchema = String((row as Record<string, unknown>).os_schema || '');
                               const osId = String((row as Record<string, unknown>).os_id || '');
                               const ofacProgramsClean = String(
@@ -4202,17 +4652,30 @@ export default function App() {
                                       {isOfac && (
                                         <span
                                           className={`px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded ${
-                                            ofacList === 'SDN'
+                                            isOfacLive
+                                              ? 'bg-rose-600 text-white ring-1 ring-rose-300'
+                                              : ofacList === 'SDN'
                                               ? 'bg-rose-700 text-white'
                                               : 'bg-amber-700 text-white'
                                           }`}
                                         >
-                                          OFAC {ofacList}
+                                          {isOfacLive ? `OFAC LIVE · ${ofacList}` : `OFAC ${ofacList}`}
+                                        </span>
+                                      )}
+                                      {isOfacLive && ofacMatchScore && (
+                                        <span className="px-1.5 py-0.5 text-[10px] font-mono-tabular font-bold bg-rose-100 text-rose-900 rounded">
+                                          Score {ofacMatchScore}%
                                         </span>
                                       )}
                                       {isOs && (
-                                        <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded bg-amber-600 text-white">
-                                          OpenSanctions
+                                        <span
+                                          className={`px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded ${
+                                            isOsLive
+                                              ? 'bg-amber-500 text-slate-950 ring-1 ring-amber-300'
+                                              : 'bg-amber-600 text-white'
+                                          }`}
+                                        >
+                                          {isOsLive ? 'OpenSanctions LIVE' : 'OpenSanctions'}
                                         </span>
                                       )}
                                       {isWikiranLive && (
@@ -5840,20 +6303,27 @@ export default function App() {
               <section className="bg-white border-2 border-emerald-400 rounded-xl overflow-hidden shadow-xs">
                 <div className="bg-slate-900 text-white px-5 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800">
                   <div className="space-y-1">
-                    <div className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
-                      {lang === 'fa'
-                        ? 'نسخه پرتابل ویندوز (.ZIP) — بدون فایل .EXE، بدون هشدار امنیتی ویندوز، بدون نیاز به نصب'
-                        : 'WINDOWS PORTABLE EDITION (.ZIP) — ZERO .EXE FILES, NO WINDOWS SECURITY BLOCK, NO INSTALLATION'}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
+                        {lang === 'fa'
+                          ? 'نسخه پرتابل ویندوز (.ZIP) — بدون فایل .EXE، بدون هشدار امنیتی ویندوز، بدون نیاز به نصب'
+                          : 'WINDOWS PORTABLE EDITION (.ZIP) — ZERO .EXE FILES, NO WINDOWS SECURITY BLOCK, NO INSTALLATION'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-[11px] font-mono-tabular font-bold text-emerald-200">
+                        v{data.app_build?.version || '2.7.0'} ·{' '}
+                        {lang === 'fa' ? 'همگام با آخرین نسخه فعلی' : 'Auto-Synced Latest Build'}
+                        {data.app_build?.dist_built_at ? ` (${data.app_build.dist_built_at})` : ''}
+                      </span>
                     </div>
                     <h3 className="text-base sm:text-lg font-bold text-white">
                       {lang === 'fa'
-                        ? 'دانلود نسخه کامل و پرتابل ویندوز (WikIranArchive_Portable_Windows.zip)'
-                        : 'WikIran Archive Portable Edition (WikIranArchive_Portable_Windows.zip)'}
+                        ? `دانلود نسخه کامل و پرتابل ویندوز v${data.app_build?.version || '2.7.0'} (WikIranArchive_Portable_Windows.zip)`
+                        : `WikIran Archive Portable Edition v${data.app_build?.version || '2.7.0'} (WikIranArchive_Portable_Windows.zip)`}
                     </h3>
                     <p className="text-xs text-slate-300 max-w-3xl">
                       {lang === 'fa'
-                        ? 'بسته کامل و آماده اجرای ویندوز شامل کل برنامه، رابط کاربری، موتور پایتون، تمام ۹۷٬۳۰۰+ رکورد آفلاین (OFAC + OpenSanctions + WikIran) و تنها چند فایل ساده .bat — بدون هیچ فایل .exe و بدون هیچ هشدار Windows Defender یا SmartScreen. کافی است از حالت فشرده خارج کنید و اجرا نمایید!'
-                        : 'Self-contained portable bundle with the full app, compiled UI, Python engine, all offline OFAC + OpenSanctions + WikIran records, and simple .bat launchers — zero .exe files, zero Windows Defender/SmartScreen warnings, and no installation wizard. Just unzip anywhere and run!'}
+                        ? 'هر بار که روی دکمه دانلود کلیک می‌کنید، سیستم به‌طور خودکار بررسی می‌کند و آخرین کامپایل همین رابط کاربری، موتور جستجوی دقیق، استعلام زنده OFAC/OpenSanctions/WikIran و تمام رکوردهای آفلاین را داخل فایل ZIP قرار می‌دهد — بدون هیچ فایل .exe!'
+                        : 'Every download automatically verifies & compiles the exact latest UI + Python engine shown here (including Exact Word Search, Live OFAC/OpenSanctions/WikIran search, Batch Watchlist Screener & Targeted Leak Downloader) with zero .exe files!'}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 shrink-0">

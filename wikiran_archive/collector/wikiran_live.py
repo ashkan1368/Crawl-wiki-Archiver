@@ -484,35 +484,47 @@ def _doc_type_display(doc_type: str) -> tuple[str, str]:
 
 
 def search_wikiran_live(
-    repo: ArchiveRepository,
+    repo: ArchiveRepository | None,
     query: str,
     *,
     max_pages: int = 2,
     tab_type: str = "all",
     leak_source: str | None = None,
     auto_cache: bool = True,
+    exact_match: bool = False,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     """
     Live-query wikiran.org/search across ALL 500,000+ leaked documents, emails, PDFs,
     Front Companies, Vessels, and articles. Auto-saves every returned hit into local SQLite + FTS5.
     """
-    q = (query or "").strip()
+    from ..search.fts_search import matches_exact_word_or_phrase, parse_exact_query
+
+    q, effective_exact = parse_exact_query(query, exact_match)
     if not q:
         return {
             "online": True,
             "query": "",
+            "exact_match": effective_exact,
             "total_label": "",
             "total_int": 0,
             "facets": [],
             "results": [],
+            "raw_cards": [],
             "cached_new_count": 0,
             "search_url": "https://wikiran.org/search",
         }
 
-    settings = repo.get_settings()
-    base_url = settings.get("source_base_url", "https://wikiran.org").rstrip("/")
+    if base_url:
+        resolved_base = base_url.rstrip("/")
+    elif repo is not None:
+        resolved_base = repo.get_settings().get("source_base_url", "https://wikiran.org").rstrip("/")
+    else:
+        resolved_base = "https://wikiran.org"
+    base_url = resolved_base
 
-    params: list[tuple[str, str]] = [("query", q), ("tabType", tab_type or "all")]
+    remote_query = f'"{q}"' if (effective_exact and " " in q) else q
+    params: list[tuple[str, str]] = [("query", remote_query), ("tabType", tab_type or "all")]
     if leak_source:
         params.append(("leaksSources[0]", leak_source))
     base_search_url = f"{base_url}/search?{urllib.parse.urlencode(params)}"
@@ -541,10 +553,12 @@ def search_wikiran_live(
             "online": False,
             "error": str(exc),
             "query": q,
+            "exact_match": effective_exact,
             "total_label": "Offline",
             "total_int": 0,
             "facets": [],
             "results": [],
+            "raw_cards": [],
             "cached_new_count": 0,
             "search_url": base_search_url,
         }
@@ -561,57 +575,60 @@ def search_wikiran_live(
     for idx, c in enumerate(all_cards, start=1):
         cat_en, cat_fa = _doc_type_display(c["doc_type"])
         leak_lbl = c["leak_source_labels"] or "WikIran Archive"
-        formatted_results.append(
-            {
-                "record_type": "WIKIRAN_LIVE",
-                "wikiran_doc_type": c["doc_type"],
-                "id": -idx,
-                "title": c["title"],
-                "native_title": c["identifier_or_imo"] or "",
-                "short_description": c["snippet"],
-                "editorial_content": (
-                    f"Source Leak: {leak_lbl}\n"
-                    f"Document Type: {cat_en}\n"
-                    + (f"Jurisdiction / Flag: {c['country_or_flag']}\n" if c["country_or_flag"] else "")
-                    + (f"Bank / Operator: {c['bank_or_operator']}\n" if c["bank_or_operator"] else "")
-                    + (f"Account / IMO / Ref: {c['identifier_or_imo']}\n" if c["identifier_or_imo"] else "")
-                    + f"\nMatched Content:\n{c['raw_description'] or c['snippet']}"
-                ),
-                "publication_date": c["document_date"] or "",
-                "category_en": f"{cat_en} ({leak_lbl})",
-                "category_fa": f"{cat_fa} ({leak_lbl})",
-                "organizations": " · ".join(
-                    b for b in [c["bank_or_operator"], c["country_or_flag"]] if b
-                ),
-                "tags": c["leak_sources"] or c["doc_type"],
-                "source_name": f"WikIran Live — {leak_lbl}",
-                "source_url": c["source_url"],
-                "extraction_status": "WIKIRAN_LIVE_CACHED" if auto_cache else "WIKIRAN_LIVE",
-                "retrieved_at": now,
-                "record_version": 1,
-                "ofac_ent_num": None,
-                "ofac_list_source": "",
-                "ofac_sdn_type": "",
-                "ofac_programs": "",
-                "ofac_aliases": "",
-                "ofac_addresses": "",
-                "ofac_countries": c["country_or_flag"],
-                "os_id": "",
-                "os_schema": "",
-                "os_datasets": "",
-                "os_identifiers": c["identifier_or_imo"],
-            }
-        )
+        rec = {
+            "record_type": "WIKIRAN_LIVE",
+            "wikiran_doc_type": c["doc_type"],
+            "id": -idx,
+            "title": c["title"],
+            "native_title": c["identifier_or_imo"] or "",
+            "short_description": c["snippet"],
+            "editorial_content": (
+                f"Source Leak: {leak_lbl}\n"
+                f"Document Type: {cat_en}\n"
+                + (f"Jurisdiction / Flag: {c['country_or_flag']}\n" if c["country_or_flag"] else "")
+                + (f"Bank / Operator: {c['bank_or_operator']}\n" if c["bank_or_operator"] else "")
+                + (f"Account / IMO / Ref: {c['identifier_or_imo']}\n" if c["identifier_or_imo"] else "")
+                + f"\nMatched Content:\n{c['raw_description'] or c['snippet']}"
+            ),
+            "publication_date": c["document_date"] or "",
+            "category_en": f"{cat_en} ({leak_lbl})",
+            "category_fa": f"{cat_fa} ({leak_lbl})",
+            "organizations": " · ".join(
+                b for b in [c["bank_or_operator"], c["country_or_flag"]] if b
+            ),
+            "tags": c["leak_sources"] or c["doc_type"],
+            "source_name": f"WikIran Live — {leak_lbl}",
+            "source_url": c["source_url"],
+            "extraction_status": "WIKIRAN_LIVE_CACHED" if auto_cache else "WIKIRAN_LIVE",
+            "retrieved_at": now,
+            "record_version": 1,
+            "ofac_ent_num": None,
+            "ofac_list_source": "",
+            "ofac_sdn_type": "",
+            "ofac_programs": "",
+            "ofac_aliases": "",
+            "ofac_addresses": "",
+            "ofac_countries": c["country_or_flag"],
+            "os_id": "",
+            "os_schema": "",
+            "os_datasets": "",
+            "os_identifiers": c["identifier_or_imo"],
+        }
+        if effective_exact and not matches_exact_word_or_phrase(rec, q):
+            continue
+        formatted_results.append(rec)
 
     return {
         "online": True,
         "query": q,
+        "exact_match": effective_exact,
         "total_label": summary_meta["total_label"],
         "total_int": summary_meta["total_int"],
         "facets": summary_meta["facets"],
         "fetched_count": len(formatted_results),
         "cached_new_count": cached_new,
         "results": formatted_results,
+        "raw_cards": all_cards,
         "search_url": base_search_url,
     }
 

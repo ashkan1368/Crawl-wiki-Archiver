@@ -43,25 +43,87 @@ DOC_FILES_MAP: dict[str, str] = {
 }
 
 
-def _load_compiled_react_assets(project_root: Path) -> tuple[str, str]:
-    """
-    Read the compiled Vite React + Tailwind CSS bundle (`dist/assets/*.css` and `dist/assets/*.js`).
-    If `dist/assets` is not yet built, runs `npm run build` automatically so the standalone HTML
-    always contains the exact React UI shown in the preview.
-    """
-    dist_assets = project_root / "dist" / "assets"
-    css_files = sorted(dist_assets.glob("*.css")) if dist_assets.exists() else []
-    js_files = sorted(dist_assets.glob("*.js")) if dist_assets.exists() else []
+APP_VERSION = "2.7.0"
 
-    if not css_files or not js_files:
+
+def _latest_source_mtime(project_root: Path) -> float:
+    """Return the newest modification timestamp across frontend source files."""
+    newest = 0.0
+    src_dir = project_root / "src"
+    if src_dir.exists():
+        for p in src_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in (".ts", ".tsx", ".js", ".jsx", ".css", ".json"):
+                try:
+                    mt = p.stat().st_mtime
+                    if mt > newest:
+                        newest = mt
+                except OSError:
+                    pass
+    for root_file in ("index.html", "package.json", "vite.config.ts"):
+        fp = project_root / root_file
+        if fp.exists():
+            try:
+                mt = fp.stat().st_mtime
+                if mt > newest:
+                    newest = mt
+            except OSError:
+                pass
+    return newest
+
+
+def get_app_build_info(project_root: Path) -> dict[str, Any]:
+    """Return live App Version and compiled frontend build freshness metadata."""
+    from datetime import datetime, timezone
+
+    dist_index = project_root / "dist" / "index.html"
+    dist_assets = project_root / "dist" / "assets"
+    has_dist = dist_index.exists() and dist_assets.exists() and bool(list(dist_assets.glob("*.js")))
+    src_mtime = _latest_source_mtime(project_root)
+    dist_mtime = dist_index.stat().st_mtime if has_dist else 0.0
+    is_fresh = has_dist and (dist_mtime + 1.0 >= src_mtime)
+    built_iso = (
+        datetime.fromtimestamp(dist_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if dist_mtime > 0
+        else "Not yet built"
+    )
+    return {
+        "version": APP_VERSION,
+        "dist_built_at": built_iso,
+        "dist_fresh": is_fresh,
+        "auto_rebuild_enabled": True,
+    }
+
+
+def ensure_fresh_dist_build(project_root: Path) -> tuple[bool, str]:
+    """
+    Guarantee `dist/` matches the exact latest `src/` UI before building any downloadable
+    Windows Portable ZIP or standalone HTML bundle. Automatically runs `npm run build`
+    if `dist/` is missing OR any source file in `src/` is newer than `dist/index.html`.
+    """
+    info = get_app_build_info(project_root)
+    rebuilt = False
+    if not info["dist_fresh"]:
         subprocess.run(
             ["npm", "run", "build"],
             cwd=str(project_root),
             check=False,
             capture_output=True,
         )
-        css_files = sorted(dist_assets.glob("*.css")) if dist_assets.exists() else []
-        js_files = sorted(dist_assets.glob("*.js")) if dist_assets.exists() else []
+        rebuilt = True
+        info = get_app_build_info(project_root)
+    return rebuilt, str(info["dist_built_at"])
+
+
+def _load_compiled_react_assets(project_root: Path) -> tuple[str, str]:
+    """
+    Read the compiled Vite React + Tailwind CSS bundle (`dist/assets/*.css` and `dist/assets/*.js`).
+    Automatically rebuilds `dist/` whenever `src/` is newer than `dist/index.html` so
+    downloadable packages always match the exact latest app UI.
+    """
+    ensure_fresh_dist_build(project_root)
+    dist_assets = project_root / "dist" / "assets"
+    css_files = sorted(dist_assets.glob("*.css")) if dist_assets.exists() else []
+    js_files = sorted(dist_assets.glob("*.js")) if dist_assets.exists() else []
 
     css_text = css_files[0].read_text(encoding="utf-8") if css_files else ""
     js_text = js_files[0].read_text(encoding="utf-8") if js_files else ""
@@ -1715,14 +1777,8 @@ def build_windows_portable_zip(
     import sqlite3
     import tempfile
 
+    _, dist_built_at = ensure_fresh_dist_build(project_root)
     dist_dir = project_root / "dist"
-    if not (dist_dir / "index.html").exists() or not list((dist_dir / "assets").glob("*.js")):
-        subprocess.run(
-            ["npm", "run", "build"],
-            cwd=str(project_root),
-            check=False,
-            capture_output=True,
-        )
 
     zip_filename = (
         "WikIranArchive_Portable_Windows.zip"
@@ -1861,11 +1917,13 @@ def build_windows_portable_zip(
 
     readme_txt = (
         "=====================================================================\r\n"
-        "  WIKIRAN ARCHIVE — WINDOWS 11 PORTABLE EDITION (NO SETUP.EXE!)\r\n"
+        f"  WIKIRAN ARCHIVE v{APP_VERSION} — WINDOWS 11 PORTABLE EDITION (NO SETUP.EXE!)\r\n"
+        f"  Compiled UI & Engine Build: {dist_built_at}\r\n"
         "=====================================================================\r\n\r\n"
         "WHY PORTABLE ZIP?\r\n"
         "- Zero unsigned .exe files -> Zero Windows Defender / SmartScreen block.\r\n"
         "- No installation wizard, no administrator rights needed.\r\n"
+        "- Includes Exact Word / Phrase Search + Live OFAC, OpenSanctions & WikIran Search.\r\n"
         "- Everything (App + Python Engine + SQLite Database with OFAC,\r\n"
         "  OpenSanctions, Front Companies & Vessels) lives inside THIS folder.\r\n"
         "- Copy this folder onto a USB drive to run on all 5 office PCs!\r\n\r\n"
@@ -1879,13 +1937,20 @@ def build_windows_portable_zip(
         "  - Double-click Create_Desktop_Shortcut.bat to put an icon on Desktop.\r\n"
         "  - Double-click 3_Stop_WikIran_Archive.bat to close the background server.\r\n\r\n"
         "---------------------------------------------------------------------\r\n"
-        "راهنمای سریع فارسی (نسخه پرتابل بدون نیاز به نصب و بدون Setup.exe):\r\n"
+        f"راهنمای سریع فارسی (نسخه پرتابل v{APP_VERSION} بدون نیاز به نصب و بدون Setup.exe):\r\n"
         "  ۱. این فایل ZIP را در هر پوشه‌ای (مثلاً C:\\WikIranArchive) از حالت فشرده خارج کنید.\r\n"
         "  ۲. فقط بار اول روی فایل 1_Install_Prerequisites.bat دابل‌کلیک کنید.\r\n"
         "  ۳. برای اجرای روزانه برنامه، روی 2_Start_WikIran_Archive.bat دابل‌کلیک کنید.\r\n"
         "  * کل دیتابیس آفلاین (اوفک + OpenSanctions + شرکت‌های پوششی + کشتی‌ها + مقالات)\r\n"
         "    داخل پوشه data همین فولدر قرار دارد و برای ۵ سیستم دیگر نیز قابل کپی است.\r\n"
         "=====================================================================\r\n"
+    )
+
+    version_txt = (
+        f"app_version={APP_VERSION}\r\n"
+        f"dist_built_at={dist_built_at}\r\n"
+        f"edition={'full_with_database' if include_database else 'fast_release_lite'}\r\n"
+        "features=exact_word_search,live_ofac_search,live_opensanctions_search,live_wikiran_search,batch_watchlist,targeted_leaks\r\n"
     )
 
     requirements_portable_txt = "# Lightweight dependency for Excel (.xlsx) workbook export\nopenpyxl>=3.1.5\n"
@@ -1918,6 +1983,7 @@ def build_windows_portable_zip(
             zf.writestr(f"{root_folder}/3_Stop_WikIran_Archive.bat", stop_app_bat)
             zf.writestr(f"{root_folder}/Create_Desktop_Shortcut.bat", shortcut_bat)
             zf.writestr(f"{root_folder}/README_START_HERE.txt", readme_txt)
+            zf.writestr(f"{root_folder}/VERSION.txt", version_txt)
             zf.writestr(f"{root_folder}/requirements_portable.txt", requirements_portable_txt)
 
             if portable_server_src.exists():
